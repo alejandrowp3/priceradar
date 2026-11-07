@@ -4,7 +4,10 @@ import path from "node:path";
 import fs from "node:fs";
 import type { Browser, BrowserContext, Page } from "@playwright/test";
 import { chromium } from "@playwright/test";
-import { InMemoryPriceRadarRepository } from "@priceradar/database";
+import {
+  DEFAULT_PRIVATE_SQLITE_DB_PATH,
+  InMemoryPriceRadarRepository,
+} from "@priceradar/database";
 import type { PriceObservationRecord } from "@priceradar/domain";
 import { buildCanonicalListingKey, createCopAmount, formatCop } from "@priceradar/domain";
 import type { ExtractedNameSource, RawStorefrontSnapshot } from "@priceradar/providers";
@@ -14,6 +17,7 @@ import {
   resolveOrProvisionContextHmacSecret,
   SupervisedBrowserSnapshotProvider,
 } from "@priceradar/providers";
+import { executePrivateHistoryCliCommand } from "./private-history-cli.ts";
 import { executeDiscoveryScan } from "./scanner.ts";
 
 const WORKSPACE_ENV_LOCAL_PATH = path.resolve(import.meta.dirname, "../../../.env.local");
@@ -27,6 +31,9 @@ interface CliOptions {
   readonly persistAuthorizedPersonalProfile: boolean;
   readonly nonInteractiveInspect: boolean;
   readonly allowProvisionalSessionObservations: boolean;
+  readonly previewPrivateHistory: boolean;
+  readonly saveToPrivateHistory: boolean;
+  readonly dbPath: string;
   readonly startUrl: string;
 }
 
@@ -64,6 +71,9 @@ function parseCliArgs(args: readonly string[]): CliOptions {
   let persistAuthorizedPersonalProfile = false;
   let nonInteractiveInspect = false;
   let allowProvisionalSessionObservations = false;
+  let previewPrivateHistory = false;
+  let saveToPrivateHistory = false;
+  let dbPath = DEFAULT_PRIVATE_SQLITE_DB_PATH;
   let startUrl = "https://www.rappi.com.co/tiendas/tipo/market";
 
   for (let i = 0; i < args.length; i += 1) {
@@ -78,6 +88,13 @@ function parseCliArgs(args: readonly string[]): CliOptions {
       nonInteractiveInspect = true;
     } else if (arg === "--allow-provisional-session-observations") {
       allowProvisionalSessionObservations = true;
+    } else if (arg === "--preview-history") {
+      previewPrivateHistory = true;
+    } else if (arg === "--save") {
+      saveToPrivateHistory = true;
+    } else if (arg === "--db-path" && args[i + 1]) {
+      dbPath = args[i + 1] ?? dbPath;
+      i += 1;
     } else if (arg === "--url" && args[i + 1]) {
       startUrl = args[i + 1] ?? startUrl;
       i += 1;
@@ -90,6 +107,9 @@ function parseCliArgs(args: readonly string[]): CliOptions {
     persistAuthorizedPersonalProfile,
     nonInteractiveInspect,
     allowProvisionalSessionObservations,
+    previewPrivateHistory,
+    saveToPrivateHistory,
+    dbPath,
     startUrl,
   };
 }
@@ -856,6 +876,41 @@ async function runSupervisedBrowserPoc(): Promise<void> {
 
   const initialProvider = new SupervisedBrowserSnapshotProvider(snapshot);
   const report = initialProvider.getInspectionReport();
+
+  if (options.previewPrivateHistory || options.saveToPrivateHistory) {
+    const privateCliResult = await executePrivateHistoryCliCommand({
+      command: options.saveToPrivateHistory ? "save" : "preview",
+      dbPath: options.dbPath,
+      snapshot,
+    });
+    console.log(
+      JSON.stringify(
+        {
+          service: "priceradar-rappi-inspect",
+          gateStatus: report.gateStatus,
+          gateMessage: report.gateMessage,
+          pageUrl: report.pageUrl,
+          observedAtIso: report.observedAtIso,
+          geographicValidation: report.geographicValidation,
+          diagnostics: report.diagnostics,
+          ...(uiDiagnostics !== undefined ? { uiDiagnostics } : {}),
+          fieldVerification: report.fieldVerification,
+          privateHistoryAction: {
+            command: privateCliResult.command,
+            titleEsCo: privateCliResult.titleEsCo,
+            messageEsCo: privateCliResult.messageEsCo,
+            ...privateCliResult.payload,
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    if (privateCliResult.exitCode !== 0) {
+      process.exit(privateCliResult.exitCode);
+    }
+    return;
+  }
 
   if (report.gateStatus !== "OK") {
     console.log(

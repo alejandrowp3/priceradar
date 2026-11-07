@@ -76,6 +76,7 @@ export interface OpportunityCandidate {
   readonly labelEsCo: string;
   readonly observedPriceCop: CopAmount;
   readonly baselinePriceCop: CopAmount;
+  readonly previousPriceCop?: CopAmount;
   readonly savingsCop: CopAmount;
   readonly discountBasisPoints: number;
   readonly discountPercentage: number;

@@ -37,6 +37,13 @@ pnpm-debug.log*
 .DS_Store
 *.pem
 *.key
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.db-*
+*.bak
+*.backup
 .vscode/
 .idea/
 .vercel/

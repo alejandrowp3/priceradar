@@ -177,3 +177,5 @@ export class InMemoryPriceRadarRepository implements PriceRadarStorageRepository
     return [...this.scanRuns];
   }
 }
+
+export * from "./sqlite-repository.ts";
