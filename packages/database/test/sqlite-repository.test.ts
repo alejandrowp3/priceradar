@@ -1,13 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { DiscoveredListing } from "@priceradar/domain";
-import { createCopAmount } from "@priceradar/domain";
+import { buildCanonicalListingKey, createCopAmount } from "@priceradar/domain";
 import type { SupervisedPersistenceContextInput } from "../src/index.ts";
 import {
   assertDatabasePathOutsideRepository,
   assertNoSensitiveTextInPersistedString,
+  computeScanBatchFingerprint,
   SqlitePrivateHistoryRepository,
 } from "../src/index.ts";
 
@@ -148,24 +150,270 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
       repo.close();
     });
 
-    it("migrates an existing v1 SQLite database cleanly to schema version 2 without losing v1 records", () => {
-      const seedRepo = new SqlitePrivateHistoryRepository(dbPath);
-      const rawDb = (
-        seedRepo as unknown as {
-          db: { exec: (sql: string) => void };
-        }
-      ).db;
-      rawDb.exec(`
-        DELETE FROM schema_migrations WHERE version = 2;
-        DROP TABLE IF EXISTS reevaluation_runs;
-        DROP INDEX IF EXISTS idx_opportunity_events_scan_origin;
-      `);
-      expect(seedRepo.getDatabaseStatus().schemaVersion).toBe(1);
-      seedRepo.close();
+    describe("F-P2-10: genuine v1 -> v2 migration", () => {
+      const V1_LISTING_KEY = buildCanonicalListingKey({
+        providerId: "rappi-authenticated-inspector",
+        externalStoreId: "900130995-turbo-super",
+        externalProductId: "2111457819",
+        externalVariantId: "var-500ml",
+        citySlug: "bogota",
+        zoneCode: VALID_CTX_HASH_A,
+      });
+      const V1_PRODUCT_KEY = "rappi-authenticated-inspector::2111457819::var-500ml";
+      const V1_STORE_KEY = "rappi-authenticated-inspector::900130995-turbo-super";
+      const V1_PROVIDER = "rappi-authenticated-inspector";
 
-      const migratedRepo = new SqlitePrivateHistoryRepository(dbPath);
-      expect(migratedRepo.getDatabaseStatus().schemaVersion).toBe(2);
-      migratedRepo.close();
+      function buildLatestV1Batch(): SupervisedPersistenceContextInput {
+        return makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "2111457819",
+              observedPriceCop: 39_900,
+              sourceObservedAt: "2026-11-07T14:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-v1-latest", observedAtIso: "2026-11-07T14:00:00.000Z" },
+        );
+      }
+
+      /** Builds a deterministic, genuine v1 database from the pre-v2 schema fixture. */
+      function createGenuineV1Database(targetPath: string): void {
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+        const schemaSql = fs.readFileSync(
+          path.join(import.meta.dirname, "fixtures", "schema-v1-pre-v2.sql"),
+          "utf8",
+        );
+        const raw = new DatabaseSync(targetPath);
+        raw.exec("PRAGMA foreign_keys = ON;");
+        raw.exec(schemaSql);
+        raw
+          .prepare(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, '001_initial_private_price_history_schema', '2026-11-01T00:00:00.000Z')",
+          )
+          .run();
+        raw
+          .prepare(
+            `INSERT INTO fulfillment_contexts (fulfillment_context_id, provider_id, verified_city_slug, verified_city_name, context_verification_status, active_address_evidence, city_metadata_evidence, serving_branch_evidence, catalog_context_evidence, pricing_verification_verdict, first_seen_at, last_seen_at)
+             VALUES (?, ?, 'bogota', 'Bogotá D.C.', 'PROVISIONAL_SESSION_CONTEXT', 'VERIFIED_ACTIVE_SELECTION', 'VERIFIED_FROM_ACTIVE_CONTEXT', 'UNVERIFIED_STATIC_DEFAULT_BRANCH', 'PROVISIONAL_LIVE_DOM_DIVERGES_FROM_STATIC_HYDRATION', 'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION', '2026-11-01T14:00:00.000Z', '2026-11-07T14:00:00.000Z')`,
+          )
+          .run(VALID_CTX_HASH_A, V1_PROVIDER);
+        raw
+          .prepare(
+            `INSERT INTO stores (store_key, provider_id, external_store_id, storefront_slug, store_name, category_slug, verified_city_slug, verified_city_name, first_seen_at, last_seen_at)
+             VALUES (?, ?, '900130995-turbo-super', '900130995-turbo-super', 'Turbo Super', 'supermercados', 'bogota', 'Bogotá D.C.', '2026-11-01T14:00:00.000Z', '2026-11-07T14:00:00.000Z')`,
+          )
+          .run(V1_STORE_KEY, V1_PROVIDER);
+        raw
+          .prepare(
+            `INSERT INTO products (product_variant_key, provider_id, external_product_id, external_variant_id, product_name, brand, category_slug, packaging_label, unit_quantity, unit_type, canonical_product_url, first_seen_at, last_seen_at)
+             VALUES (?, ?, '2111457819', 'var-500ml', 'Aceite de Oliva Extra Virgen', 'Carbonell', 'supermercados', '500 ml', 500, 'ml', 'https://www.rappi.com.co/p/aceite-oliva-2111457819', '2026-11-01T14:00:00.000Z', '2026-11-07T14:00:00.000Z')`,
+          )
+          .run(V1_PRODUCT_KEY, V1_PROVIDER);
+
+        const latestFingerprint = computeScanBatchFingerprint(
+          buildLatestV1Batch(),
+          "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+          "UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION",
+        );
+        const insertScan = raw.prepare(
+          `INSERT INTO scan_runs (scan_run_id, batch_fingerprint, started_at, completed_at, status, provider_id, store_key, fulfillment_context_id, candidates_discovered, valid_observations, skipped_records, duplicate_records, opportunities_created)
+           VALUES (?, ?, ?, ?, 'SUCCEEDED', ?, ?, ?, 1, 1, 0, 0, ?)`,
+        );
+        const insertObs = raw.prepare(
+          `INSERT INTO price_observations (observation_id, idempotency_key, listing_key, scan_run_id, product_variant_key, store_key, fulfillment_context_id, city_slug, observed_price_cop, declared_reference_price_cop, availability, observed_at, provenance, geographic_verification_verdict, serving_branch_evidence, catalog_context_evidence, address_specific_pricing_verified, is_superseded)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'bogota', ?, NULL, 'IN_STOCK', ?, 'PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL', 'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION', 'UNVERIFIED_STATIC_DEFAULT_BRANCH', 'PROVISIONAL_LIVE_DOM_DIVERGES_FROM_STATIC_HYDRATION', 0, 0)`,
+        );
+        for (const [scanId, iso, price, fingerprint, opps] of [
+          ["scan-v1-a", "2026-11-01T14:00:00.000Z", 65_000, "v1-fixture-fp-a", 0],
+          ["scan-v1-b", "2026-11-02T14:00:00.000Z", 65_000, "v1-fixture-fp-b", 0],
+          ["scan-v1-latest", "2026-11-07T14:00:00.000Z", 39_900, latestFingerprint, 1],
+        ] as const) {
+          insertScan.run(
+            scanId,
+            fingerprint,
+            iso,
+            iso,
+            V1_PROVIDER,
+            V1_STORE_KEY,
+            VALID_CTX_HASH_A,
+            opps,
+          );
+          insertObs.run(
+            `obs-${scanId}`,
+            `idem-${scanId}`,
+            V1_LISTING_KEY,
+            scanId,
+            V1_PRODUCT_KEY,
+            V1_STORE_KEY,
+            VALID_CTX_HASH_A,
+            price,
+            iso,
+          );
+        }
+        raw
+          .prepare(
+            `INSERT INTO opportunity_events (opportunity_id, deduplication_key, listing_key, observation_id, scan_run_id, product_variant_key, store_key, fulfillment_context_id, opportunity_type, label_es_co, baseline_price_cop, previous_price_cop, observed_price_cop, savings_cop, discount_basis_points, discount_percentage, historical_observation_count, historical_low_cop, historical_median_cop, confidence, requires_verification, provenance, geographic_verification_verdict, rationale_es_co, detected_at, lifecycle_status)
+             VALUES ('opp-v1-fixture', 'v1-fixture-dedup', ?, 'obs-scan-v1-latest', 'scan-v1-latest', ?, ?, ?, 'HISTORICAL_LOW', 'Mínimo histórico', 65000, 65000, 39900, 25100, 3862, 39, 2, 65000, 65000, 'MEDIUM', 1, 'PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL', 'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION', 'Fixture determinista v1', '2026-11-07T14:00:00.000Z', 'ACTIVE')`,
+          )
+          .run(V1_LISTING_KEY, V1_PRODUCT_KEY, V1_STORE_KEY, VALID_CTX_HASH_A);
+        raw.close();
+      }
+
+      function columnNames(raw: DatabaseSync, table: string): string[] {
+        return (
+          raw.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+        ).map((c) => c.name);
+      }
+
+      function tableExists(raw: DatabaseSync, table: string): boolean {
+        return (
+          raw
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .get(table) !== undefined
+        );
+      }
+
+      it("opens an authentic v1 database, migrates it to v2 preserving all data, and is idempotent on reopen", () => {
+        createGenuineV1Database(dbPath);
+
+        // 3. v2-only artifacts are absent before migration
+        const before = new DatabaseSync(dbPath);
+        expect(columnNames(before, "opportunity_events")).not.toContain("event_origin");
+        expect(columnNames(before, "opportunity_events")).not.toContain(
+          "reevaluation_run_id",
+        );
+        expect(tableExists(before, "reevaluation_runs")).toBe(false);
+        expect(
+          (
+            before.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as {
+              v: number;
+            }
+          ).v,
+        ).toBe(1);
+        before.close();
+
+        // 4-5. open with the current repository
+        const repo = new SqlitePrivateHistoryRepository(dbPath);
+        const status = repo.getDatabaseStatus();
+        expect(status.schemaVersion).toBe(2);
+        expect(status.counts.activeObservations).toBe(3);
+        expect(status.counts.scanRuns).toBe(3);
+
+        const runs = repo.listRecentScanRuns();
+        expect(runs).toHaveLength(3);
+        expect(
+          runs.find((r) => r.scanRunId === "scan-v1-latest")?.opportunitiesCreated,
+        ).toBe(1);
+        expect(runs.find((r) => r.scanRunId === "scan-v1-a")?.opportunitiesCreated).toBe(
+          0,
+        );
+
+        const active = repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" });
+        expect(active).toHaveLength(1);
+        expect(active[0]?.opportunityId).toBe("opp-v1-fixture");
+        expect(active[0]?.eventOrigin).toBe("ORIGINAL_SCAN");
+        expect(active[0]?.reevaluationRunId).toBeUndefined();
+        expect(active[0]?.baselinePriceCop).toBe(65_000);
+
+        // successful idempotent replay of the original v1 scan after migration
+        const replay = repo.persistApprovedInspectionBatch(buildLatestV1Batch(), {
+          ownerConfirmed: true,
+        });
+        expect(replay.persisted).toBe(true);
+        expect(replay.idempotentReplay).toBe(true);
+        expect(replay.reason).toBe("IDEMPOTENT_SCAN_RUN_REPLAY");
+        repo.close();
+
+        // valid foreign keys + v2 artifacts present + reopen idempotency
+        const after = new DatabaseSync(dbPath);
+        after.exec("PRAGMA foreign_keys = ON;");
+        expect(after.prepare("PRAGMA foreign_key_check").all()).toHaveLength(0);
+        expect(columnNames(after, "opportunity_events")).toContain("event_origin");
+        expect(tableExists(after, "reevaluation_runs")).toBe(true);
+        const migrationsAfterFirst = after
+          .prepare(
+            "SELECT version, name, applied_at FROM schema_migrations ORDER BY version",
+          )
+          .all();
+        expect(
+          migrationsAfterFirst.map((m) => (m as { version: number }).version),
+        ).toEqual([1, 2]);
+        after.close();
+
+        const reopened = new SqlitePrivateHistoryRepository(dbPath);
+        expect(reopened.getDatabaseStatus().schemaVersion).toBe(2);
+        reopened.close();
+        const afterReopen = new DatabaseSync(dbPath);
+        expect(
+          afterReopen
+            .prepare(
+              "SELECT version, name, applied_at FROM schema_migrations ORDER BY version",
+            )
+            .all(),
+        ).toEqual(migrationsAfterFirst);
+        afterReopen.close();
+      });
+
+      it("supports explicit reevaluation on a migrated v1 database: legacy event is preserved as SUPERSEDED and replaced by a HISTORICAL_REEVALUATION event", () => {
+        createGenuineV1Database(dbPath);
+        const repo = new SqlitePrivateHistoryRepository(dbPath);
+        const reeval = repo.reevaluateLatestListingOpportunities({
+          evaluationTimeIso: "2026-11-07T15:00:00.000Z",
+        });
+        expect(reeval.listingsEvaluated).toBe(1);
+        expect(reeval.opportunitiesInserted).toBe(1);
+
+        const active = repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" });
+        expect(active).toHaveLength(1);
+        expect(active[0]?.eventOrigin).toBe("HISTORICAL_REEVALUATION");
+        const legacy = repo.listDetectedOpportunities({ lifecycleStatus: "SUPERSEDED" });
+        expect(legacy.map((o) => o.opportunityId)).toContain("opp-v1-fixture");
+        expect(
+          repo.listRecentScanRuns().find((r) => r.scanRunId === "scan-v1-latest")
+            ?.opportunitiesCreated,
+        ).toBe(1);
+        repo.close();
+      });
+
+      it("rolls back the entire v2 migration atomically when it fails midway, leaving a pristine v1 database that migrates on the next open", () => {
+        createGenuineV1Database(dbPath);
+
+        expect(
+          () =>
+            new SqlitePrivateHistoryRepository(dbPath, {
+              simulateMigrationFailureAfterV2Step: "ADD_COLUMNS",
+            }),
+        ).toThrow(/simulated migration failure/i);
+
+        const raw = new DatabaseSync(dbPath);
+        expect(columnNames(raw, "opportunity_events")).not.toContain("event_origin");
+        expect(columnNames(raw, "opportunity_events")).not.toContain(
+          "reevaluation_run_id",
+        );
+        expect(tableExists(raw, "reevaluation_runs")).toBe(false);
+        expect(
+          (
+            raw.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as {
+              v: number;
+            }
+          ).v,
+        ).toBe(1);
+        expect(
+          (
+            raw.prepare("SELECT COUNT(*) AS c FROM opportunity_events").get() as {
+              c: number;
+            }
+          ).c,
+        ).toBe(1);
+        raw.close();
+
+        const repo = new SqlitePrivateHistoryRepository(dbPath);
+        expect(repo.getDatabaseStatus().schemaVersion).toBe(2);
+        expect(
+          repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" }),
+        ).toHaveLength(1);
+        repo.close();
+      });
     });
 
     it("rejects any SQLite database path inside the Git repository tree", () => {
@@ -1025,6 +1273,168 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
       );
 
       repo.close();
+    });
+  });
+
+  describe("Adversarial Review Round 4 — F-P2-09 reactivation semantics", () => {
+    function seedBaselineAScenario(repo: SqlitePrivateHistoryRepository): void {
+      for (const [id, iso, price] of [
+        ["scan-h1", "2026-11-01T14:00:00.000Z", 80_000],
+        ["scan-h2", "2026-11-02T14:00:00.000Z", 80_000],
+        ["scan-h3", "2026-11-03T14:00:00.000Z", 50_000],
+        ["scan-h4", "2026-11-04T14:00:00.000Z", 50_000],
+        ["scan-latest", "2026-11-07T14:00:00.000Z", 39_900],
+      ] as const) {
+        repo.persistApprovedInspectionBatch(
+          makeSupervisedBatchInput(
+            [
+              makeProvisionalListing({
+                externalProductId: "2111457819",
+                observedPriceCop: price,
+                sourceObservedAt: iso,
+              }),
+            ],
+            { scanRunId: id, observedAtIso: iso },
+          ),
+          { ownerConfirmed: true },
+        );
+      }
+    }
+
+    function obsId(repo: SqlitePrivateHistoryRepository, scanRunId: string): string {
+      const found = repo
+        .getProductPriceHistory("2111457819")
+        .find((o) => o.scanRunId === scanRunId);
+      if (!found) throw new Error(`missing observation for ${scanRunId}`);
+      return found.observationId;
+    }
+
+    it("F-P2-09: A -> B -> A baseline cycle leaves exactly one ACTIVE opportunity with baseline A and preserves every event", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+      seedBaselineAScenario(repo);
+      const h1 = obsId(repo, "scan-h1");
+      const h2 = obsId(repo, "scan-h2");
+
+      // 1. baseline A (median 65.000, 4 observations)
+      const initial = repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" });
+      expect(initial).toHaveLength(1);
+      expect(initial[0]?.baselinePriceCop).toBe(65_000);
+      const eventAId = initial[0]?.opportunityId ?? "";
+
+      // 2-3. correct history -> baseline B; A superseded, B active
+      repo.markObservationSuperseded(h1, "corrección 1");
+      repo.markObservationSuperseded(h2, "corrección 1");
+      const toB = repo.reevaluateLatestListingOpportunities({
+        evaluationTimeIso: "2026-11-07T14:05:00.000Z",
+      });
+      expect(toB.opportunitiesSuperseded).toBe(1);
+      expect(toB.opportunitiesInserted).toBe(1);
+      const activeB = repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" });
+      expect(activeB).toHaveLength(1);
+      expect(activeB[0]?.baselinePriceCop).toBe(50_000);
+      const supersededA = repo.listDetectedOpportunities({
+        lifecycleStatus: "SUPERSEDED",
+      });
+      expect(supersededA.map((o) => o.opportunityId)).toContain(eventAId);
+
+      // 4-5. correct history again -> baseline A valid again
+      expect(repo.restoreSupersededObservation(h1)).toBe(true);
+      expect(repo.restoreSupersededObservation(h2)).toBe(true);
+      const backToA = repo.reevaluateLatestListingOpportunities({
+        evaluationTimeIso: "2026-11-07T14:10:00.000Z",
+      });
+      expect(backToA.opportunitiesSuperseded).toBe(1);
+      expect(backToA.opportunitiesReactivated).toBe(1);
+      expect(backToA.opportunitiesInserted).toBe(0);
+
+      // 6. exactly one correct ACTIVE opportunity with baseline A
+      const activeAgain = repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" });
+      expect(activeAgain).toHaveLength(1);
+      expect(activeAgain[0]?.baselinePriceCop).toBe(65_000);
+      expect(activeAgain[0]?.historicalObservationCount).toBe(4);
+      expect(activeAgain[0]?.opportunityId).toBe(eventAId);
+
+      // B is preserved (auditable) as SUPERSEDED, never deleted
+      const supersededNow = repo.listDetectedOpportunities({
+        lifecycleStatus: "SUPERSEDED",
+      });
+      expect(supersededNow.map((o) => o.baselinePriceCop)).toContain(50_000);
+      expect(supersededNow.every((o) => o.opportunityId !== eventAId)).toBe(true);
+
+      // Append-only audit trail of A: ACTIVE -> SUPERSEDED -> ACTIVE
+      const trail = repo.listOpportunityLifecycleTransitions(eventAId);
+      expect(trail.map((t) => `${t.fromStatus}>${t.toStatus}`)).toEqual([
+        "ACTIVE>SUPERSEDED",
+        "SUPERSEDED>ACTIVE",
+      ]);
+      expect(trail[1]?.reason).toBe("BASELINE_VALID_AGAIN_AFTER_HISTORY_CORRECTION");
+      expect(trail[1]?.reevaluationRunId).toBe(backToA.reevaluationRunId);
+
+      // Reevaluation is idempotent: no inserts, supersessions, reactivations or new transitions
+      const replay = repo.reevaluateLatestListingOpportunities({
+        evaluationTimeIso: "2026-11-07T14:15:00.000Z",
+      });
+      expect(replay.opportunitiesInserted).toBe(0);
+      expect(replay.opportunitiesSuperseded).toBe(0);
+      expect(replay.opportunitiesReactivated).toBe(0);
+      expect(repo.listOpportunityLifecycleTransitions(eventAId)).toHaveLength(2);
+      expect(repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" })).toHaveLength(
+        1,
+      );
+
+      repo.close();
+    });
+
+    it("F-P2-09: reevaluation never reactivates DISMISSED or EXPIRED opportunities", () => {
+      for (const terminal of ["DISMISSED", "EXPIRED"] as const) {
+        const terminalDbPath = path.join(
+          tempDir,
+          `terminal-${terminal}`,
+          "history.sqlite",
+        );
+        const repo = new SqlitePrivateHistoryRepository(terminalDbPath);
+        seedBaselineAScenario(repo);
+        const h1 = obsId(repo, "scan-h1");
+        const h2 = obsId(repo, "scan-h2");
+        const eventAId =
+          repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" })[0]
+            ?.opportunityId ?? "";
+
+        // Owner/time moves A into a terminal state
+        (
+          repo as unknown as {
+            db: { prepare: (sql: string) => { run: (...args: string[]) => unknown } };
+          }
+        ).db
+          .prepare(
+            "UPDATE opportunity_events SET lifecycle_status = ? WHERE opportunity_id = ?",
+          )
+          .run(terminal, eventAId);
+
+        // History moves to B (A is terminal, not ACTIVE, so only B is created)...
+        repo.markObservationSuperseded(h1, "corrección");
+        repo.markObservationSuperseded(h2, "corrección");
+        repo.reevaluateLatestListingOpportunities({
+          evaluationTimeIso: "2026-11-07T14:05:00.000Z",
+        });
+        // ...and returns to baseline A: terminal A must stay terminal
+        repo.restoreSupersededObservation(h1);
+        repo.restoreSupersededObservation(h2);
+        const result = repo.reevaluateLatestListingOpportunities({
+          evaluationTimeIso: "2026-11-07T14:10:00.000Z",
+        });
+
+        expect(result.opportunitiesReactivated).toBe(0);
+        expect(result.opportunitiesInserted).toBe(0);
+        expect(
+          repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" }),
+        ).toHaveLength(0);
+        const terminalRows = repo.listDetectedOpportunities({
+          lifecycleStatus: terminal,
+        });
+        expect(terminalRows.map((o) => o.opportunityId)).toEqual([eventAId]);
+        repo.close();
+      }
     });
   });
 });
