@@ -1,0 +1,36 @@
+{
+  "name": "priceradar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Automated price intelligence platform for Colombia (COP)",
+  "packageManager": "pnpm@10.24.0",
+  "engines": {
+    "node": ">=24.0.0 <25.0.0",
+    "pnpm": "10.24.0"
+  },
+  "scripts": {
+    "check:port": "node scripts/check-port.mjs",
+    "dev": "node scripts/check-port.mjs && pnpm --filter @priceradar/web dev",
+    "build": "pnpm -r build",
+    "start": "node scripts/check-port.mjs && pnpm --filter @priceradar/web start",
+    "worker:scan": "pnpm --filter @priceradar/worker scan",
+    "rappi:inspect": "pnpm --filter @priceradar/worker rappi:inspect",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "format:write": "prettier --write .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "node scripts/check-port.mjs && playwright test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@playwright/test": "^1.50.0",
+    "@types/node": "^22.10.0",
+    "eslint": "^9.18.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.20.0",
+    "vitest": "^3.0.4"
+  }
+}

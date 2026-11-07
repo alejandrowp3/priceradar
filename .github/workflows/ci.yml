@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint, Typecheck, and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # actions/checkout v4.2.2
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # pnpm/action-setup v4.1.0
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
+        with:
+          version: 10.24.0
+
+      # actions/setup-node v4.2.0
+      - name: Setup Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a
+        with:
+          node-version-file: ".nvmrc"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Secret exposure & forbidden file check
+        run: |
+          if git ls-files | grep -E '^\.env(\..+)?$' | grep -v '^\.env\.example$'; then
+            echo "ERROR: Tracked .env file detected in repository."
+            exit 1
+          fi
+          if git grep -I -E '(postgresql://[^$[:space:]]+:[^@[:space:]]+@|ghp_[A-Za-z0-9]{30,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' -- . ':!.github/workflows/ci.yml' ':!.env.example'; then
+            echo "ERROR: Potential hardcoded credential detected."
+            exit 1
+          fi
+
+      - name: Verify port isolation preflight
+        run: pnpm check:port
+
+      - name: Run ESLint
+        run: pnpm lint
+
+      - name: Run TypeScript typecheck
+        run: pnpm typecheck
+
+      - name: Run unit and integration tests
+        run: pnpm test
+
+      - name: Run standalone discovery worker slice
+        run: pnpm worker:scan
+
+      - name: Run production build
+        run: pnpm build

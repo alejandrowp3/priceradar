@@ -1,0 +1,26 @@
+{
+  "name": "@priceradar/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 4178 -H 127.0.0.1",
+    "build": "next build",
+    "start": "next start -p 4178 -H 127.0.0.1",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@priceradar/config": "workspace:*",
+    "@priceradar/database": "workspace:*",
+    "@priceradar/domain": "workspace:*",
+    "@priceradar/providers": "workspace:*",
+    "@priceradar/ui": "workspace:*",
+    "next": "^15.2.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4"
+  }
+}
