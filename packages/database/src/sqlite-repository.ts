@@ -53,6 +53,8 @@ export type GeographicVerificationVerdictType =
 export type OpportunityLifecycleStatus =
   "ACTIVE" | "SUPERSEDED" | "EXPIRED" | "DISMISSED";
 
+export type OpportunityEventOrigin = "ORIGINAL_SCAN" | "HISTORICAL_REEVALUATION";
+
 export interface SupervisedPersistenceContextInput {
   readonly scanRunId: string;
   readonly observedAtIso: string;
@@ -137,6 +139,7 @@ export interface PersistApprovedBatchResult {
 }
 
 export interface ReevaluateLatestOpportunitiesResult {
+  readonly reevaluationRunId: string;
   readonly listingsEvaluated: number;
   readonly opportunitiesInserted: number;
   readonly opportunitiesSuperseded: number;
@@ -219,6 +222,8 @@ export interface PersistedOpportunityEventRow {
   readonly rationaleEsCo: string;
   readonly detectedAt: string;
   readonly lifecycleStatus: OpportunityLifecycleStatus;
+  readonly eventOrigin: OpportunityEventOrigin;
+  readonly reevaluationRunId?: string;
 }
 
 export interface PrivateDatabaseStatusSummary {
@@ -429,12 +434,25 @@ CREATE INDEX IF NOT EXISTS idx_price_observations_listing_history
 CREATE INDEX IF NOT EXISTS idx_price_observations_product
   ON price_observations(product_variant_key, observed_at DESC);
 
+CREATE TABLE IF NOT EXISTS reevaluation_runs (
+  reevaluation_run_id TEXT PRIMARY KEY,
+  executed_at TEXT NOT NULL,
+  target_listing_key TEXT,
+  listings_evaluated INTEGER NOT NULL DEFAULT 0 CHECK (listings_evaluated >= 0),
+  opportunities_inserted INTEGER NOT NULL DEFAULT 0 CHECK (opportunities_inserted >= 0),
+  opportunities_superseded INTEGER NOT NULL DEFAULT 0 CHECK (opportunities_superseded >= 0)
+);
+
 CREATE TABLE IF NOT EXISTS opportunity_events (
   opportunity_id TEXT PRIMARY KEY,
   deduplication_key TEXT NOT NULL UNIQUE,
   listing_key TEXT NOT NULL,
   observation_id TEXT NOT NULL REFERENCES price_observations(observation_id) ON DELETE CASCADE,
   scan_run_id TEXT NOT NULL REFERENCES scan_runs(scan_run_id) ON DELETE CASCADE,
+  event_origin TEXT NOT NULL DEFAULT 'ORIGINAL_SCAN' CHECK (
+    event_origin IN ('ORIGINAL_SCAN', 'HISTORICAL_REEVALUATION')
+  ),
+  reevaluation_run_id TEXT REFERENCES reevaluation_runs(reevaluation_run_id),
   product_variant_key TEXT NOT NULL REFERENCES products(product_variant_key),
   store_key TEXT NOT NULL REFERENCES stores(store_key),
   fulfillment_context_id TEXT NOT NULL REFERENCES fulfillment_contexts(fulfillment_context_id),
@@ -476,7 +494,23 @@ CREATE INDEX IF NOT EXISTS idx_opportunity_events_listing
 
 CREATE INDEX IF NOT EXISTS idx_opportunity_events_type
   ON opportunity_events(opportunity_type, lifecycle_status, discount_basis_points DESC);
+
+CREATE INDEX IF NOT EXISTS idx_opportunity_events_scan_origin
+  ON opportunity_events(scan_run_id, event_origin);
 `;
+
+/**
+ * Builds a baseline-aware opportunity deduplication key (`Round 3 Additional Check`).
+ * Embeds `baselinePriceCop`, `previousPriceCop`, `historicalObservationCount`, `historicalLowCop`,
+ * and `historicalMedianCop` so that when historical baseline observations are corrected or superseded,
+ * a recalculated candidate with updated baseline metrics never collides with a stale opportunity row.
+ */
+export function buildOpportunityDeduplicationKey(
+  opp: OpportunityCandidate,
+  observationId: string,
+): string {
+  return `${opp.opportunityKey}::${observationId}::base=${String(opp.baselinePriceCop)}:prev=${String(opp.previousPriceCop ?? 0)}:cnt=${String(opp.historicalObservationCount)}:low=${String(opp.historicalLowCop)}:med=${String(opp.historicalMedianCop)}`;
+}
 
 /**
  * Evaluates whether a supervised storefront inspection snapshot meets all Phase P2
@@ -679,16 +713,47 @@ export class SqlitePrivateHistoryRepository {
       if (!scanRunsColumns.some((col) => col.name === "batch_fingerprint")) {
         this.db.exec("ALTER TABLE scan_runs ADD COLUMN batch_fingerprint TEXT;");
       }
-      const existing = this.db
+
+      const oppColumns = this.db
+        .prepare("PRAGMA table_info(opportunity_events)")
+        .all() as Array<{ name: string }>;
+      if (!oppColumns.some((col) => col.name === "event_origin")) {
+        this.db.exec(
+          "ALTER TABLE opportunity_events ADD COLUMN event_origin TEXT NOT NULL DEFAULT 'ORIGINAL_SCAN' CHECK (event_origin IN ('ORIGINAL_SCAN', 'HISTORICAL_REEVALUATION'));",
+        );
+      }
+      if (!oppColumns.some((col) => col.name === "reevaluation_run_id")) {
+        this.db.exec(
+          "ALTER TABLE opportunity_events ADD COLUMN reevaluation_run_id TEXT REFERENCES reevaluation_runs(reevaluation_run_id);",
+        );
+      }
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_opportunity_events_scan_origin ON opportunity_events(scan_run_id, event_origin);",
+      );
+
+      const nowIso = new Date().toISOString();
+      const existingV1 = this.db
         .prepare("SELECT version FROM schema_migrations WHERE version = 1")
         .get() as { version?: number } | undefined;
-      if (!existing) {
+      if (!existingV1) {
         this.db
           .prepare(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
           )
-          .run(1, "001_initial_private_price_history_schema", new Date().toISOString());
+          .run(1, "001_initial_private_price_history_schema", nowIso);
       }
+
+      const existingV2 = this.db
+        .prepare("SELECT version FROM schema_migrations WHERE version = 2")
+        .get() as { version?: number } | undefined;
+      if (!existingV2) {
+        this.db
+          .prepare(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+          )
+          .run(2, "002_reevaluation_audit_and_event_origin", nowIso);
+      }
+
       this.db.exec("COMMIT;");
     } catch (err) {
       this.db.exec("ROLLBACK;");
@@ -1126,7 +1191,7 @@ export class SqlitePrivateHistoryRepository {
               .get(context.scanRunId) as { c: number } | undefined;
             const oppCountRow = this.db
               .prepare(
-                "SELECT COUNT(*) as c FROM opportunity_events WHERE scan_run_id = ?",
+                "SELECT COUNT(*) as c FROM opportunity_events WHERE scan_run_id = ? AND event_origin = 'ORIGINAL_SCAN'",
               )
               .get(context.scanRunId) as { c: number } | undefined;
 
@@ -1345,6 +1410,8 @@ export class SqlitePrivateHistoryRepository {
             listing_key,
             observation_id,
             scan_run_id,
+            event_origin,
+            reevaluation_run_id,
             product_variant_key,
             store_key,
             fulfillment_context_id,
@@ -1366,7 +1433,7 @@ export class SqlitePrivateHistoryRepository {
             rationale_es_co,
             detected_at,
             lifecycle_status
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+          ) VALUES (?, ?, ?, ?, ?, 'ORIGINAL_SCAN', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
           ON CONFLICT(deduplication_key) DO NOTHING`,
         );
 
@@ -1512,7 +1579,7 @@ export class SqlitePrivateHistoryRepository {
           });
 
           for (const opp of candidates) {
-            const deduplicationKey = `${opp.opportunityKey}::${observationId}`;
+            const deduplicationKey = buildOpportunityDeduplicationKey(opp, observationId);
             const opportunityId = `opp::${context.scanRunId}::${opp.opportunityKey}`;
             const oppResult = insertOpportunityStmt.run(
               opportunityId,
@@ -1554,12 +1621,14 @@ export class SqlitePrivateHistoryRepository {
           }
         }
 
-        // F-P2-07: Verify final persisted counts match in-memory counters before marking SUCCEEDED
+        // F-P2-07 & F-P2-08: Verify final persisted counts for ORIGINAL_SCAN match in-memory counters before marking SUCCEEDED
         const persistedObsCheck = this.db
           .prepare("SELECT COUNT(*) as c FROM price_observations WHERE scan_run_id = ?")
           .get(context.scanRunId) as { c: number } | undefined;
         const persistedOppCheck = this.db
-          .prepare("SELECT COUNT(*) as c FROM opportunity_events WHERE scan_run_id = ?")
+          .prepare(
+            "SELECT COUNT(*) as c FROM opportunity_events WHERE scan_run_id = ? AND event_origin = 'ORIGINAL_SCAN'",
+          )
           .get(context.scanRunId) as { c: number } | undefined;
 
         const actualObsCount = Number(persistedObsCheck?.c ?? 0);
@@ -1621,23 +1690,45 @@ export class SqlitePrivateHistoryRepository {
   }
 
   /**
-   * Explicit, separate operation to reevaluate the chronologically latest active observation
-   * for a listing (or all listings) after out-of-order historical backfills or manual superseding (`F-P2-06`).
+   * Explicit, separate auditable operation to reevaluate the chronologically latest active observation
+   * for a listing (or all listings) after out-of-order historical backfills or manual superseding (`F-P2-06`, `F-P2-08`, `Round 3 Additional Check`).
+   *
+   * - Preserves immutable `scan_runs.opportunities_created` counters by tagging recalculated opportunities
+   *   with `event_origin = 'HISTORICAL_REEVALUATION'` and recording a `reevaluation_runs` audit row.
+   * - Supersedes any currently `ACTIVE` opportunity whose baseline metrics or eligibility have become stale
+   *   after historical observations were superseded or corrected.
    */
   public reevaluateLatestListingOpportunities(options?: {
     readonly listingKey?: string;
     readonly intelligenceConfig?: PriceIntelligenceConfig;
     readonly evaluationTimeIso?: string;
+    readonly reevaluationRunId?: string;
   }): ReevaluateLatestOpportunitiesResult {
     const intelligenceConfig =
       options?.intelligenceConfig ?? PRIVATE_HISTORY_INTELLIGENCE_CONFIG;
     const evaluationTimeIso = options?.evaluationTimeIso ?? new Date().toISOString();
+    const reevaluationRunId =
+      options?.reevaluationRunId ??
+      `reeval::${evaluationTimeIso}::${crypto.randomUUID().slice(0, 8)}`;
 
     let listingsEvaluated = 0;
     let opportunitiesInserted = 0;
     let opportunitiesSuperseded = 0;
 
     this.withImmediateTransaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO reevaluation_runs (
+            reevaluation_run_id,
+            executed_at,
+            target_listing_key,
+            listings_evaluated,
+            opportunities_inserted,
+            opportunities_superseded
+          ) VALUES (?, ?, ?, 0, 0, 0)`,
+        )
+        .run(reevaluationRunId, evaluationTimeIso, options?.listingKey ?? null);
+
       const distinctGroups = (
         options?.listingKey
           ? this.db
@@ -1694,6 +1785,18 @@ export class SqlitePrivateHistoryRepository {
         LIMIT 1`,
       );
 
+      const activeOppsForGroupStmt = this.db.prepare(
+        `SELECT opportunity_id, opportunity_type, deduplication_key
+         FROM opportunity_events
+         WHERE listing_key = ? AND provenance = ? AND lifecycle_status = 'ACTIVE'`,
+      );
+
+      const supersedeByIdStmt = this.db.prepare(
+        `UPDATE opportunity_events
+         SET lifecycle_status = 'SUPERSEDED'
+         WHERE opportunity_id = ? AND lifecycle_status = 'ACTIVE'`,
+      );
+
       const insertOpportunityStmt = this.db.prepare(
         `INSERT INTO opportunity_events (
           opportunity_id,
@@ -1701,6 +1804,8 @@ export class SqlitePrivateHistoryRepository {
           listing_key,
           observation_id,
           scan_run_id,
+          event_origin,
+          reevaluation_run_id,
           product_variant_key,
           store_key,
           fulfillment_context_id,
@@ -1722,7 +1827,7 @@ export class SqlitePrivateHistoryRepository {
           rationale_es_co,
           detected_at,
           lifecycle_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+        ) VALUES (?, ?, ?, ?, ?, 'HISTORICAL_REEVALUATION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
         ON CONFLICT(deduplication_key) DO NOTHING`,
       );
 
@@ -1764,9 +1869,6 @@ export class SqlitePrivateHistoryRepository {
           latest.listing_key,
           latest.provenance,
         );
-        const existingOpportunities = this.getExistingActiveOpportunitiesForListing(
-          latest.listing_key,
-        );
 
         const synthesizedListing: DiscoveredListing = {
           providerId: latest.provider_id,
@@ -1807,23 +1909,57 @@ export class SqlitePrivateHistoryRepository {
           sourceObservedAt: latest.observed_at,
         };
 
+        // Compute ground-truth candidates against current non-superseded history without cooldown suppression
         const candidates = evaluateListingOpportunities({
           listing: synthesizedListing,
           historicalObservations: allHistory,
-          existingOpportunities,
+          existingOpportunities: [],
           config: intelligenceConfig,
           evaluationTimeIso,
         });
 
-        for (const opp of candidates) {
-          const deduplicationKey = `${opp.opportunityKey}::${latest.observation_id}`;
-          const opportunityId = `opp::reeval::${latest.observation_id}::${opp.opportunityKey}`;
+        const recalculatedDedupKeys = new Set<string>();
+        const candidatesWithKeys = candidates.map((opp) => {
+          const deduplicationKey = buildOpportunityDeduplicationKey(
+            opp,
+            latest.observation_id,
+          );
+          recalculatedDedupKeys.add(deduplicationKey);
+          return { opp, deduplicationKey };
+        });
+
+        const currentlyActiveRows = activeOppsForGroupStmt.all(
+          latest.listing_key,
+          latest.provenance,
+        ) as Array<{
+          opportunity_id: string;
+          opportunity_type: OpportunityType;
+          deduplication_key: string;
+        }>;
+
+        const alreadyActiveDedupKeys = new Set<string>();
+        for (const activeRow of currentlyActiveRows) {
+          if (recalculatedDedupKeys.has(activeRow.deduplication_key)) {
+            alreadyActiveDedupKeys.add(activeRow.deduplication_key);
+          } else {
+            // Stale baseline or invalidated opportunity -> supersede explicitly
+            const supRes = supersedeByIdStmt.run(activeRow.opportunity_id);
+            opportunitiesSuperseded += Number(supRes.changes);
+          }
+        }
+
+        for (const { opp, deduplicationKey } of candidatesWithKeys) {
+          if (alreadyActiveDedupKeys.has(deduplicationKey)) {
+            continue;
+          }
+          const opportunityId = `opp::${reevaluationRunId}::${latest.observation_id}::${opp.opportunityKey}`;
           const oppResult = insertOpportunityStmt.run(
             opportunityId,
             deduplicationKey,
             latest.listing_key,
             latest.observation_id,
             latest.scan_run_id,
+            reevaluationRunId,
             latest.product_variant_key,
             latest.store_key,
             latest.fulfillment_context_id,
@@ -1848,23 +1984,28 @@ export class SqlitePrivateHistoryRepository {
 
           if (Number(oppResult.changes) > 0) {
             opportunitiesInserted += 1;
-            const supRes = this.db
-              .prepare(
-                `UPDATE opportunity_events
-                 SET lifecycle_status = 'SUPERSEDED'
-                 WHERE listing_key = ?
-                   AND opportunity_type = ?
-                   AND deduplication_key != ?
-                   AND lifecycle_status = 'ACTIVE'`,
-              )
-              .run(latest.listing_key, opp.type, deduplicationKey);
-            opportunitiesSuperseded += Number(supRes.changes);
           }
         }
       }
+
+      this.db
+        .prepare(
+          `UPDATE reevaluation_runs
+           SET listings_evaluated = ?,
+               opportunities_inserted = ?,
+               opportunities_superseded = ?
+           WHERE reevaluation_run_id = ?`,
+        )
+        .run(
+          listingsEvaluated,
+          opportunitiesInserted,
+          opportunitiesSuperseded,
+          reevaluationRunId,
+        );
     });
 
     return {
+      reevaluationRunId,
       listingsEvaluated,
       opportunitiesInserted,
       opportunitiesSuperseded,
@@ -2152,7 +2293,9 @@ export class SqlitePrivateHistoryRepository {
         e.geographic_verification_verdict,
         e.rationale_es_co,
         e.detected_at,
-        e.lifecycle_status
+        e.lifecycle_status,
+        e.event_origin,
+        e.reevaluation_run_id
       FROM opportunity_events e
       JOIN products p ON p.product_variant_key = e.product_variant_key
       JOIN stores s ON s.store_key = e.store_key
@@ -2208,6 +2351,8 @@ export class SqlitePrivateHistoryRepository {
       rationale_es_co: string;
       detected_at: string;
       lifecycle_status: OpportunityLifecycleStatus;
+      event_origin: OpportunityEventOrigin;
+      reevaluation_run_id: string | null;
     }>;
 
     return rows.map((r) => ({
@@ -2243,6 +2388,10 @@ export class SqlitePrivateHistoryRepository {
       rationaleEsCo: r.rationale_es_co,
       detectedAt: r.detected_at,
       lifecycleStatus: r.lifecycle_status,
+      eventOrigin: r.event_origin,
+      ...(r.reevaluation_run_id !== null
+        ? { reevaluationRunId: r.reevaluation_run_id }
+        : {}),
     }));
   }
 }

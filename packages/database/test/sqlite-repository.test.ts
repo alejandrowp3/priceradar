@@ -136,7 +136,7 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
       const status = repo.getDatabaseStatus();
 
       expect(status.existsOnDisk).toBe(true);
-      expect(status.schemaVersion).toBe(1);
+      expect(status.schemaVersion).toBe(2);
       expect(status.directoryModeOctal).toBe("0700");
       expect(status.fileModeOctal).toBe("0600");
 
@@ -146,6 +146,26 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
       expect(fileMode).toBe(0o600);
 
       repo.close();
+    });
+
+    it("migrates an existing v1 SQLite database cleanly to schema version 2 without losing v1 records", () => {
+      const seedRepo = new SqlitePrivateHistoryRepository(dbPath);
+      const rawDb = (
+        seedRepo as unknown as {
+          db: { exec: (sql: string) => void };
+        }
+      ).db;
+      rawDb.exec(`
+        DELETE FROM schema_migrations WHERE version = 2;
+        DROP TABLE IF EXISTS reevaluation_runs;
+        DROP INDEX IF EXISTS idx_opportunity_events_scan_origin;
+      `);
+      expect(seedRepo.getDatabaseStatus().schemaVersion).toBe(1);
+      seedRepo.close();
+
+      const migratedRepo = new SqlitePrivateHistoryRepository(dbPath);
+      expect(migratedRepo.getDatabaseStatus().schemaVersion).toBe(2);
+      migratedRepo.close();
     });
 
     it("rejects any SQLite database path inside the Git repository tree", () => {
@@ -835,6 +855,174 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
       expect(activeAfterReeval).toHaveLength(1);
       expect(activeAfterReeval[0]?.observedPriceCop).toBe(39_900);
       expect(activeAfterReeval[0]?.previousPriceCop).toBe(65_000);
+
+      repo.close();
+    });
+
+    it("F-P2-08: replaying the original scan_run_id with identical batch fingerprint after reevaluateLatestListingOpportunities() must succeed without transaction-integrity failure while preserving immutable scan_runs.opportunities_created", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      // 1. Save a first observation at $39,900 with zero historical opportunities
+      const firstBatch = makeSupervisedBatchInput(
+        [
+          makeProvisionalListing({
+            externalProductId: "2111457819",
+            observedPriceCop: 39_900,
+            sourceObservedAt: "2026-11-07T14:00:00.000Z",
+          }),
+        ],
+        { scanRunId: "scan-nov7-first", observedAtIso: "2026-11-07T14:00:00.000Z" },
+      );
+
+      const firstSave = repo.persistApprovedInspectionBatch(firstBatch, {
+        ownerConfirmed: true,
+      });
+      expect(firstSave.persisted).toBe(true);
+      expect(firstSave.observationsInserted).toBe(1);
+      expect(firstSave.opportunitiesInserted).toBe(0);
+
+      // 2. Backfill two older observations at $65,000
+      for (const [id, iso] of [
+        ["scan-backfill-1", "2026-11-01T14:00:00.000Z"],
+        ["scan-backfill-2", "2026-11-02T14:00:00.000Z"],
+      ] as const) {
+        repo.persistApprovedInspectionBatch(
+          makeSupervisedBatchInput(
+            [
+              makeProvisionalListing({
+                externalProductId: "2111457819",
+                observedPriceCop: 65_000,
+                sourceObservedAt: iso,
+              }),
+            ],
+            { scanRunId: id, observedAtIso: iso },
+          ),
+          { ownerConfirmed: true },
+        );
+      }
+
+      // 3. Run reevaluateLatestListingOpportunities()
+      const reeval = repo.reevaluateLatestListingOpportunities({
+        evaluationTimeIso: "2026-11-07T15:00:00.000Z",
+      });
+
+      // 4. Confirm that a new historical opportunity is created
+      expect(reeval.opportunitiesInserted).toBe(1);
+      expect(reeval.reevaluationRunId).toMatch(/^reeval::/);
+      const activeOpportunities = repo.listDetectedOpportunities({
+        lifecycleStatus: "ACTIVE",
+      });
+      expect(activeOpportunities).toHaveLength(1);
+      expect(activeOpportunities[0]?.observedPriceCop).toBe(39_900);
+      expect(activeOpportunities[0]?.eventOrigin).toBe("HISTORICAL_REEVALUATION");
+      expect(activeOpportunities[0]?.reevaluationRunId).toBe(reeval.reevaluationRunId);
+
+      // 5. Replay the original scan_run_id ("scan-nov7-first") with the identical batch fingerprint
+      const replayAfterReeval = repo.persistApprovedInspectionBatch(firstBatch, {
+        ownerConfirmed: true,
+      });
+
+      // 6. Assert that legitimate reevaluation does NOT cause a transaction-integrity failure,
+      //    and original scan_runs.opportunities_created remains immutably 0
+      expect(replayAfterReeval.persisted).toBe(true);
+      expect(replayAfterReeval.idempotentReplay).toBe(true);
+      expect(replayAfterReeval.reason).toBe("IDEMPOTENT_SCAN_RUN_REPLAY");
+
+      const originalRun = repo
+        .listRecentScanRuns()
+        .find((r) => r.scanRunId === "scan-nov7-first");
+      expect(originalRun?.status).toBe("SUCCEEDED");
+      expect(originalRun?.validObservations).toBe(1);
+      expect(originalRun?.opportunitiesCreated).toBe(0);
+
+      repo.close();
+    });
+
+    it("Round 3 Additional Check: superseding historical baseline observations recalculates or invalidates stale ACTIVE opportunity baselines on reevaluation", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      // 1. Save 4 historical observations: two inflated ($80,000) and two normal ($50,000),
+      //    followed by latest observation at $39,900 -> produces HISTORICAL_LOW against median $65,000 (savings $25,100, 3862 bps)
+      for (const [id, iso, price] of [
+        ["scan-h1", "2026-11-01T14:00:00.000Z", 80_000],
+        ["scan-h2", "2026-11-02T14:00:00.000Z", 80_000],
+        ["scan-h3", "2026-11-03T14:00:00.000Z", 50_000],
+        ["scan-h4", "2026-11-04T14:00:00.000Z", 50_000],
+        ["scan-latest", "2026-11-07T14:00:00.000Z", 39_900],
+      ] as const) {
+        repo.persistApprovedInspectionBatch(
+          makeSupervisedBatchInput(
+            [
+              makeProvisionalListing({
+                externalProductId: "2111457819",
+                observedPriceCop: price,
+                sourceObservedAt: iso,
+              }),
+            ],
+            { scanRunId: id, observedAtIso: iso },
+          ),
+          { ownerConfirmed: true },
+        );
+      }
+
+      const initialActive = repo.listDetectedOpportunities({
+        lifecycleStatus: "ACTIVE",
+      });
+      expect(initialActive).toHaveLength(1);
+      expect(initialActive[0]?.baselinePriceCop).toBe(65_000);
+      expect(initialActive[0]?.savingsCop).toBe(25_100);
+      expect(initialActive[0]?.discountBasisPoints).toBe(3862);
+      expect(initialActive[0]?.historicalObservationCount).toBe(4);
+
+      // 2. Mark the two erroneous $80,000 baseline observations (scan-h1, scan-h2) as superseded
+      const allHistory = repo.getProductPriceHistory("2111457819");
+      const h1Obs = allHistory.find((o) => o.scanRunId === "scan-h1");
+      const h2Obs = allHistory.find((o) => o.scanRunId === "scan-h2");
+      expect(h1Obs).toBeDefined();
+      expect(h2Obs).toBeDefined();
+
+      repo.markObservationSuperseded(
+        h1Obs?.observationId ?? "",
+        "Precio base erróneo corregido",
+      );
+      repo.markObservationSuperseded(
+        h2Obs?.observationId ?? "",
+        "Precio base erróneo corregido",
+      );
+
+      // 3. Reevaluate latest opportunities -> must supersede the stale $65,000-baseline opportunity
+      //    and replace it with the recalculated $50,000-baseline opportunity (savings $10,100, 2020 bps, count=2)
+      const reevalAfterCorrection = repo.reevaluateLatestListingOpportunities({
+        evaluationTimeIso: "2026-11-07T14:05:00.000Z",
+      });
+      expect(reevalAfterCorrection.opportunitiesSuperseded).toBe(1);
+      expect(reevalAfterCorrection.opportunitiesInserted).toBe(1);
+
+      const updatedActive = repo.listDetectedOpportunities({
+        lifecycleStatus: "ACTIVE",
+      });
+      expect(updatedActive).toHaveLength(1);
+      expect(updatedActive[0]?.baselinePriceCop).toBe(50_000);
+      expect(updatedActive[0]?.savingsCop).toBe(10_100);
+      expect(updatedActive[0]?.discountBasisPoints).toBe(2020);
+      expect(updatedActive[0]?.historicalObservationCount).toBe(2);
+
+      // 4. Now supersede scan-h3 ($50,000) so only 1 prior observation remains (< minHistoryForDrop=2):
+      //    reevaluation must invalidate the active HISTORICAL_LOW so 0 stale ACTIVE opportunities remain!
+      const h3Obs = allHistory.find((o) => o.scanRunId === "scan-h3");
+      repo.markObservationSuperseded(
+        h3Obs?.observationId ?? "",
+        "Segundo ajuste de historial",
+      );
+
+      const reevalInvalidated = repo.reevaluateLatestListingOpportunities({
+        evaluationTimeIso: "2026-11-07T14:10:00.000Z",
+      });
+      expect(reevalInvalidated.opportunitiesSuperseded).toBe(1);
+      expect(reevalInvalidated.opportunitiesInserted).toBe(0);
+      expect(repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" })).toHaveLength(
+        0,
+      );
 
       repo.close();
     });
