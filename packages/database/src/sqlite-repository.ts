@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -120,13 +121,25 @@ export interface PersistApprovedBatchOptions {
 
 export interface PersistApprovedBatchResult {
   readonly persisted: boolean;
+  readonly idempotentReplay?: boolean;
   readonly reason:
-    "PERSISTED_COMMITTED" | "OWNER_DECLINED" | "INELIGIBLE_BATCH" | "TRANSACTION_FAILED";
+    | "PERSISTED_COMMITTED"
+    | "IDEMPOTENT_SCAN_RUN_REPLAY"
+    | "CONFLICTING_SCAN_RUN_ID"
+    | "OWNER_DECLINED"
+    | "INELIGIBLE_BATCH"
+    | "TRANSACTION_FAILED";
   readonly scanRunId: string;
   readonly observationsInserted: number;
   readonly observationsSkippedDuplicate: number;
   readonly opportunitiesInserted: number;
   readonly errorSummary?: string;
+}
+
+export interface ReevaluateLatestOpportunitiesResult {
+  readonly listingsEvaluated: number;
+  readonly opportunitiesInserted: number;
+  readonly opportunitiesSuperseded: number;
 }
 
 export interface PersistedScanRunRow {
@@ -352,6 +365,7 @@ CREATE TABLE IF NOT EXISTS fulfillment_contexts (
 
 CREATE TABLE IF NOT EXISTS scan_runs (
   scan_run_id TEXT PRIMARY KEY,
+  batch_fingerprint TEXT,
   started_at TEXT NOT NULL,
   completed_at TEXT,
   status TEXT NOT NULL CHECK (
@@ -575,6 +589,47 @@ export function evaluateBatchPersistenceEligibility(
 }
 
 /**
+ * Computes a deterministic SHA-256 hex fingerprint for an inspection batch (`F-P2-07`).
+ * Used to distinguish an identical idempotent `scan_run_id` replay from a conflicting reuse.
+ */
+export function computeScanBatchFingerprint(
+  context: SupervisedPersistenceContextInput,
+  effectiveProvenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE",
+  effectiveVerdict: GeographicVerificationVerdictType,
+): string {
+  const canonicalListings = context.listings
+    .map((item) => ({
+      providerId: item.providerId,
+      storeId: item.store.externalStoreId,
+      productId: item.variant.externalProductId,
+      variantId: item.variant.externalVariantId,
+      observedPriceCop: item.observedPriceCop,
+      declaredReferencePriceCop: item.declaredReferencePriceCop ?? null,
+      availability: item.availability,
+      sourceObservedAt: item.sourceObservedAt,
+    }))
+    .sort((a, b) =>
+      `${a.providerId}::${a.storeId}::${a.productId}::${a.variantId}::${a.sourceObservedAt}`.localeCompare(
+        `${b.providerId}::${b.storeId}::${b.productId}::${b.variantId}::${b.sourceObservedAt}`,
+      ),
+    );
+
+  const canonicalPayload = JSON.stringify({
+    observedAtIso: context.observedAtIso,
+    citySlug: context.citySlug,
+    fulfillmentContextHash: context.fulfillmentContextHash ?? null,
+    effectiveProvenance,
+    effectiveVerdict,
+    candidatesDiscoveredCount: context.candidatesDiscoveredCount,
+    skippedMalformedCount: context.skippedMalformedCount,
+    duplicateSuppressedCount: context.duplicateSuppressedCount,
+    listings: canonicalListings,
+  });
+
+  return crypto.createHash("sha256").update(canonicalPayload).digest("hex");
+}
+
+/**
  * Local private SQLite storage repository (`Phase P2`) backed by Node.js built-in `node:sqlite`.
  */
 export class SqlitePrivateHistoryRepository {
@@ -618,6 +673,12 @@ export class SqlitePrivateHistoryRepository {
     this.db.exec("BEGIN IMMEDIATE;");
     try {
       this.db.exec(MIGRATION_V1_SQL);
+      const scanRunsColumns = this.db
+        .prepare("PRAGMA table_info(scan_runs)")
+        .all() as Array<{ name: string }>;
+      if (!scanRunsColumns.some((col) => col.name === "batch_fingerprint")) {
+        this.db.exec("ALTER TABLE scan_runs ADD COLUMN batch_fingerprint TEXT;");
+      }
       const existing = this.db
         .prepare("SELECT version FROM schema_migrations WHERE version = 1")
         .get() as { version?: number } | undefined;
@@ -913,15 +974,21 @@ export class SqlitePrivateHistoryRepository {
       else if (comparison.movement === "PRICE_DECREASE") priceDecreasesCount += 1;
       else if (comparison.movement === "PRICE_INCREASE") priceIncreasesCount += 1;
 
-      const candidateOpportunities = alreadyExists
-        ? []
-        : evaluateListingOpportunities({
-            listing: normalizedListing,
-            historicalObservations,
-            existingOpportunities,
-            config: intelligenceConfig,
-            evaluationTimeIso: context.observedAtIso,
-          });
+      const currentObservedAtMs = Date.parse(normalizedListing.sourceObservedAt);
+      const hasNewerActiveObservation = historicalObservations.some(
+        (obs) => Date.parse(obs.observedAt) > currentObservedAtMs,
+      );
+
+      const candidateOpportunities =
+        alreadyExists || hasNewerActiveObservation
+          ? []
+          : evaluateListingOpportunities({
+              listing: normalizedListing,
+              historicalObservations,
+              existingOpportunities,
+              config: intelligenceConfig,
+              evaluationTimeIso: context.observedAtIso,
+            });
 
       candidateOpportunitiesCount += candidateOpportunities.length;
       items.push({
@@ -960,7 +1027,7 @@ export class SqlitePrivateHistoryRepository {
   }
 
   /**
-   * Atomically persists an eligible, owner-approved inspection batch into SQLite (`Sections 6-10`).
+   * Atomically persists an eligible, owner-approved inspection batch into SQLite (`Sections 6-10`, `F-P2-06`, `F-P2-07`).
    * Never writes if `options.ownerConfirmed !== true`.
    */
   public persistApprovedInspectionBatch(
@@ -1002,6 +1069,11 @@ export class SqlitePrivateHistoryRepository {
     const contextHash = context.fulfillmentContextHash;
     const intelligenceConfig =
       options.intelligenceConfig ?? PRIVATE_HISTORY_INTELLIGENCE_CONFIG;
+    const batchFingerprint = computeScanBatchFingerprint(
+      context,
+      effectiveProvenance,
+      effectiveVerdict,
+    );
 
     assertNoSensitiveTextInPersistedString(contextHash, "fulfillmentContextHash");
     assertNoSensitiveTextInPersistedString(context.citySlug, "citySlug");
@@ -1010,12 +1082,88 @@ export class SqlitePrivateHistoryRepository {
     let observationsInserted = 0;
     let observationsSkippedDuplicate = 0;
     let opportunitiesInserted = 0;
+    let earlyScanRunResult: PersistApprovedBatchResult | undefined;
 
     try {
       this.withImmediateTransaction(() => {
         const firstListing = context.listings[0];
         if (!firstListing) {
           throw new Error("Empty listings in eligible batch.");
+        }
+
+        // F-P2-07: Check if scan_run_id already exists before any mutation
+        const existingScanRun = this.db
+          .prepare(
+            `SELECT
+              status,
+              batch_fingerprint,
+              valid_observations,
+              duplicate_records,
+              opportunities_created
+            FROM scan_runs
+            WHERE scan_run_id = ?
+            LIMIT 1`,
+          )
+          .get(context.scanRunId) as
+          | {
+              status: string;
+              batch_fingerprint: string | null;
+              valid_observations: number;
+              duplicate_records: number;
+              opportunities_created: number;
+            }
+          | undefined;
+
+        if (existingScanRun) {
+          if (
+            existingScanRun.status === "SUCCEEDED" &&
+            existingScanRun.batch_fingerprint === batchFingerprint
+          ) {
+            const obsCountRow = this.db
+              .prepare(
+                "SELECT COUNT(*) as c FROM price_observations WHERE scan_run_id = ?",
+              )
+              .get(context.scanRunId) as { c: number } | undefined;
+            const oppCountRow = this.db
+              .prepare(
+                "SELECT COUNT(*) as c FROM opportunity_events WHERE scan_run_id = ?",
+              )
+              .get(context.scanRunId) as { c: number } | undefined;
+
+            const persistedObsForRun = Number(obsCountRow?.c ?? 0);
+            const persistedOppForRun = Number(oppCountRow?.c ?? 0);
+
+            if (
+              persistedObsForRun !== existingScanRun.valid_observations ||
+              persistedOppForRun !== existingScanRun.opportunities_created
+            ) {
+              throw new Error(
+                `Execution integrity error: existing scan_run_id '${context.scanRunId}' counters (${String(existingScanRun.valid_observations)}/${String(existingScanRun.opportunities_created)}) do not match persisted rows (${String(persistedObsForRun)}/${String(persistedOppForRun)}).`,
+              );
+            }
+
+            earlyScanRunResult = {
+              persisted: true,
+              idempotentReplay: true,
+              reason: "IDEMPOTENT_SCAN_RUN_REPLAY",
+              scanRunId: context.scanRunId,
+              observationsInserted: 0,
+              observationsSkippedDuplicate: context.listings.length,
+              opportunitiesInserted: 0,
+            };
+            return;
+          }
+
+          earlyScanRunResult = {
+            persisted: false,
+            reason: "CONFLICTING_SCAN_RUN_ID",
+            scanRunId: context.scanRunId,
+            observationsInserted: 0,
+            observationsSkippedDuplicate: 0,
+            opportunitiesInserted: 0,
+            errorSummary: `Reused scan_run_id '${context.scanRunId}' conflicts with an existing execution (status=${existingScanRun.status}). Never overwrite a completed or active scan run with conflicting batch data.`,
+          };
+          return;
         }
 
         const providerId = firstListing.providerId;
@@ -1111,11 +1259,12 @@ export class SqlitePrivateHistoryRepository {
             context.observedAtIso,
           );
 
-        // 3. Upsert scan_runs header (status = RUNNING during transaction, updated to SUCCEEDED at end)
+        // 3. Insert new scan_runs header (strict INSERT without ON CONFLICT DO UPDATE)
         this.db
           .prepare(
             `INSERT INTO scan_runs (
               scan_run_id,
+              batch_fingerprint,
               started_at,
               completed_at,
               status,
@@ -1127,12 +1276,11 @@ export class SqlitePrivateHistoryRepository {
               skipped_records,
               duplicate_records,
               opportunities_created
-            ) VALUES (?, ?, NULL, 'RUNNING', ?, ?, ?, ?, 0, ?, ?, 0)
-            ON CONFLICT(scan_run_id) DO UPDATE SET
-              status = 'RUNNING'`,
+            ) VALUES (?, ?, ?, NULL, 'RUNNING', ?, ?, ?, ?, 0, ?, ?, 0)`,
           )
           .run(
             context.scanRunId,
+            batchFingerprint,
             context.observedAtIso,
             providerId,
             storeKey,
@@ -1190,10 +1338,6 @@ export class SqlitePrivateHistoryRepository {
           ON CONFLICT(idempotency_key) DO NOTHING`,
         );
 
-        const findObservationByIdempotencyStmt = this.db.prepare(
-          `SELECT observation_id FROM price_observations WHERE idempotency_key = ? LIMIT 1`,
-        );
-
         const insertOpportunityStmt = this.db.prepare(
           `INSERT INTO opportunity_events (
             opportunity_id,
@@ -1229,7 +1373,13 @@ export class SqlitePrivateHistoryRepository {
         const supersedeOlderOpportunitiesStmt = this.db.prepare(
           `UPDATE opportunity_events
            SET lifecycle_status = 'SUPERSEDED'
-           WHERE listing_key = ? AND opportunity_type = ? AND deduplication_key != ? AND lifecycle_status = 'ACTIVE'`,
+           WHERE listing_key = ?
+             AND opportunity_type = ?
+             AND deduplication_key != ?
+             AND lifecycle_status = 'ACTIVE'
+             AND observation_id IN (
+               SELECT observation_id FROM price_observations WHERE observed_at <= ?
+             )`,
         );
 
         for (const rawListing of context.listings) {
@@ -1313,11 +1463,14 @@ export class SqlitePrivateHistoryRepository {
           );
 
           const wasInserted = Number(insertResult.changes) > 0;
-          if (wasInserted) {
-            observationsInserted += 1;
-          } else {
+          if (!wasInserted) {
+            // F-P2-06: Duplicate observations must NEVER generate new opportunity events
+            // or supersede existing active opportunities during replay.
             observationsSkippedDuplicate += 1;
+            continue;
           }
+
+          observationsInserted += 1;
 
           if (
             options.simulateCrashAfterObservationsInserted !== undefined &&
@@ -1328,9 +1481,16 @@ export class SqlitePrivateHistoryRepository {
             );
           }
 
-          const persistedObsRow = findObservationByIdempotencyStmt.get(idempotencyKey) as
-            { observation_id: string } | undefined;
-          const effectiveObservationId = persistedObsRow?.observation_id ?? observationId;
+          // Targeted Check #1: If a chronologically newer active observation already exists for this
+          // (listingKey, provenance), this observation is an out-of-order historical backfill and
+          // must NOT emit a misleading current alert or supersede newer opportunities.
+          const currentObservedAtMs = Date.parse(rawListing.sourceObservedAt);
+          const hasNewerActiveObservation = historicalObservations.some(
+            (obs) => Date.parse(obs.observedAt) > currentObservedAtMs,
+          );
+          if (hasNewerActiveObservation) {
+            continue;
+          }
 
           const normalizedListing: DiscoveredListing = {
             ...rawListing,
@@ -1352,13 +1512,13 @@ export class SqlitePrivateHistoryRepository {
           });
 
           for (const opp of candidates) {
-            const deduplicationKey = `${opp.opportunityKey}::${rawListing.sourceObservedAt}`;
+            const deduplicationKey = `${opp.opportunityKey}::${observationId}`;
             const opportunityId = `opp::${context.scanRunId}::${opp.opportunityKey}`;
             const oppResult = insertOpportunityStmt.run(
               opportunityId,
               deduplicationKey,
               listingKey,
-              effectiveObservationId,
+              observationId,
               context.scanRunId,
               productVariantKey,
               storeKey,
@@ -1384,9 +1544,34 @@ export class SqlitePrivateHistoryRepository {
 
             if (Number(oppResult.changes) > 0) {
               opportunitiesInserted += 1;
-              supersedeOlderOpportunitiesStmt.run(listingKey, opp.type, deduplicationKey);
+              supersedeOlderOpportunitiesStmt.run(
+                listingKey,
+                opp.type,
+                deduplicationKey,
+                rawListing.sourceObservedAt,
+              );
             }
           }
+        }
+
+        // F-P2-07: Verify final persisted counts match in-memory counters before marking SUCCEEDED
+        const persistedObsCheck = this.db
+          .prepare("SELECT COUNT(*) as c FROM price_observations WHERE scan_run_id = ?")
+          .get(context.scanRunId) as { c: number } | undefined;
+        const persistedOppCheck = this.db
+          .prepare("SELECT COUNT(*) as c FROM opportunity_events WHERE scan_run_id = ?")
+          .get(context.scanRunId) as { c: number } | undefined;
+
+        const actualObsCount = Number(persistedObsCheck?.c ?? 0);
+        const actualOppCount = Number(persistedOppCheck?.c ?? 0);
+
+        if (
+          actualObsCount !== observationsInserted ||
+          actualOppCount !== opportunitiesInserted
+        ) {
+          throw new Error(
+            `Execution consistency check failed for scan_run_id '${context.scanRunId}': expected (${String(observationsInserted)}, ${String(opportunitiesInserted)}) but persisted (${String(actualObsCount)}, ${String(actualOppCount)}).`,
+          );
         }
 
         // 4. Mark scan_run as SUCCEEDED
@@ -1402,12 +1587,16 @@ export class SqlitePrivateHistoryRepository {
           )
           .run(
             new Date().toISOString(),
-            observationsInserted,
+            actualObsCount,
             observationsSkippedDuplicate,
-            opportunitiesInserted,
+            actualOppCount,
             context.scanRunId,
           );
       });
+
+      if (earlyScanRunResult) {
+        return earlyScanRunResult;
+      }
 
       return {
         persisted: true,
@@ -1429,6 +1618,257 @@ export class SqlitePrivateHistoryRepository {
         errorSummary: errorMessage,
       };
     }
+  }
+
+  /**
+   * Explicit, separate operation to reevaluate the chronologically latest active observation
+   * for a listing (or all listings) after out-of-order historical backfills or manual superseding (`F-P2-06`).
+   */
+  public reevaluateLatestListingOpportunities(options?: {
+    readonly listingKey?: string;
+    readonly intelligenceConfig?: PriceIntelligenceConfig;
+    readonly evaluationTimeIso?: string;
+  }): ReevaluateLatestOpportunitiesResult {
+    const intelligenceConfig =
+      options?.intelligenceConfig ?? PRIVATE_HISTORY_INTELLIGENCE_CONFIG;
+    const evaluationTimeIso = options?.evaluationTimeIso ?? new Date().toISOString();
+
+    let listingsEvaluated = 0;
+    let opportunitiesInserted = 0;
+    let opportunitiesSuperseded = 0;
+
+    this.withImmediateTransaction(() => {
+      const distinctGroups = (
+        options?.listingKey
+          ? this.db
+              .prepare(
+                `SELECT DISTINCT listing_key, provenance
+                 FROM price_observations
+                 WHERE is_superseded = 0 AND listing_key = ?`,
+              )
+              .all(options.listingKey)
+          : this.db
+              .prepare(
+                `SELECT DISTINCT listing_key, provenance
+                 FROM price_observations
+                 WHERE is_superseded = 0`,
+              )
+              .all()
+      ) as Array<{
+        listing_key: string;
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+      }>;
+
+      const latestObsStmt = this.db.prepare(
+        `SELECT
+          o.observation_id,
+          o.listing_key,
+          o.scan_run_id,
+          o.product_variant_key,
+          o.store_key,
+          o.fulfillment_context_id,
+          o.city_slug,
+          o.observed_price_cop,
+          o.declared_reference_price_cop,
+          o.availability,
+          o.observed_at,
+          o.provenance,
+          o.geographic_verification_verdict,
+          p.provider_id,
+          p.external_product_id,
+          p.external_variant_id,
+          p.product_name,
+          p.brand,
+          p.category_slug,
+          p.packaging_label,
+          p.unit_quantity,
+          p.unit_type,
+          p.canonical_product_url,
+          s.external_store_id,
+          s.store_name
+        FROM price_observations o
+        JOIN products p ON p.product_variant_key = o.product_variant_key
+        JOIN stores s ON s.store_key = o.store_key
+        WHERE o.listing_key = ? AND o.provenance = ? AND o.is_superseded = 0
+        ORDER BY o.observed_at DESC, o.observation_id DESC
+        LIMIT 1`,
+      );
+
+      const insertOpportunityStmt = this.db.prepare(
+        `INSERT INTO opportunity_events (
+          opportunity_id,
+          deduplication_key,
+          listing_key,
+          observation_id,
+          scan_run_id,
+          product_variant_key,
+          store_key,
+          fulfillment_context_id,
+          opportunity_type,
+          label_es_co,
+          baseline_price_cop,
+          previous_price_cop,
+          observed_price_cop,
+          savings_cop,
+          discount_basis_points,
+          discount_percentage,
+          historical_observation_count,
+          historical_low_cop,
+          historical_median_cop,
+          confidence,
+          requires_verification,
+          provenance,
+          geographic_verification_verdict,
+          rationale_es_co,
+          detected_at,
+          lifecycle_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+        ON CONFLICT(deduplication_key) DO NOTHING`,
+      );
+
+      for (const group of distinctGroups) {
+        const latest = latestObsStmt.get(group.listing_key, group.provenance) as
+          | {
+              observation_id: string;
+              listing_key: string;
+              scan_run_id: string;
+              product_variant_key: string;
+              store_key: string;
+              fulfillment_context_id: string;
+              city_slug: string;
+              observed_price_cop: number;
+              declared_reference_price_cop: number | null;
+              availability: AvailabilityStatus;
+              observed_at: string;
+              provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+              geographic_verification_verdict: GeographicVerificationVerdictType;
+              provider_id: string;
+              external_product_id: string;
+              external_variant_id: string;
+              product_name: string;
+              brand: string | null;
+              category_slug: string;
+              packaging_label: string;
+              unit_quantity: number;
+              unit_type: "g" | "ml" | "unit" | "kg" | "l";
+              canonical_product_url: string;
+              external_store_id: string;
+              store_name: string;
+            }
+          | undefined;
+
+        if (!latest) continue;
+        listingsEvaluated += 1;
+
+        const allHistory = this.getPersistedHistoryForListing(
+          latest.listing_key,
+          latest.provenance,
+        );
+        const existingOpportunities = this.getExistingActiveOpportunitiesForListing(
+          latest.listing_key,
+        );
+
+        const synthesizedListing: DiscoveredListing = {
+          providerId: latest.provider_id,
+          store: {
+            providerId: latest.provider_id,
+            externalStoreId: latest.external_store_id,
+            name: latest.store_name,
+            categorySlug: latest.category_slug,
+          },
+          variant: {
+            externalProductId: latest.external_product_id,
+            externalVariantId: latest.external_variant_id,
+            name: latest.product_name,
+            brand: latest.brand ?? "Sin marca especificada",
+            categorySlug: latest.category_slug,
+            categoryName: latest.category_slug,
+            packagingLabel: latest.packaging_label,
+            unitQuantity: latest.unit_quantity,
+            unitType: latest.unit_type,
+            productUrl: latest.canonical_product_url,
+          },
+          geographicContext: {
+            countryCode: "CO",
+            citySlug: latest.city_slug,
+            cityName: latest.city_slug,
+            zoneCode: latest.fulfillment_context_id,
+          },
+          observedPriceCop: createCopAmount(latest.observed_price_cop),
+          ...(latest.declared_reference_price_cop !== null
+            ? {
+                declaredReferencePriceCop: createCopAmount(
+                  latest.declared_reference_price_cop,
+                ),
+              }
+            : {}),
+          availability: latest.availability,
+          provenance: latest.provenance,
+          sourceObservedAt: latest.observed_at,
+        };
+
+        const candidates = evaluateListingOpportunities({
+          listing: synthesizedListing,
+          historicalObservations: allHistory,
+          existingOpportunities,
+          config: intelligenceConfig,
+          evaluationTimeIso,
+        });
+
+        for (const opp of candidates) {
+          const deduplicationKey = `${opp.opportunityKey}::${latest.observation_id}`;
+          const opportunityId = `opp::reeval::${latest.observation_id}::${opp.opportunityKey}`;
+          const oppResult = insertOpportunityStmt.run(
+            opportunityId,
+            deduplicationKey,
+            latest.listing_key,
+            latest.observation_id,
+            latest.scan_run_id,
+            latest.product_variant_key,
+            latest.store_key,
+            latest.fulfillment_context_id,
+            opp.type,
+            opp.labelEsCo,
+            opp.baselinePriceCop,
+            opp.previousPriceCop ?? null,
+            opp.observedPriceCop,
+            opp.savingsCop,
+            opp.discountBasisPoints,
+            opp.discountPercentage,
+            opp.historicalObservationCount,
+            opp.historicalLowCop,
+            opp.historicalMedianCop,
+            opp.confidence,
+            opp.requiresVerification ? 1 : 0,
+            latest.provenance,
+            latest.geographic_verification_verdict,
+            opp.rationaleEsCo,
+            opp.detectedAt,
+          );
+
+          if (Number(oppResult.changes) > 0) {
+            opportunitiesInserted += 1;
+            const supRes = this.db
+              .prepare(
+                `UPDATE opportunity_events
+                 SET lifecycle_status = 'SUPERSEDED'
+                 WHERE listing_key = ?
+                   AND opportunity_type = ?
+                   AND deduplication_key != ?
+                   AND lifecycle_status = 'ACTIVE'`,
+              )
+              .run(latest.listing_key, opp.type, deduplicationKey);
+            opportunitiesSuperseded += Number(supRes.changes);
+          }
+        }
+      }
+    });
+
+    return {
+      listingsEvaluated,
+      opportunitiesInserted,
+      opportunitiesSuperseded,
+    };
   }
 
   /**

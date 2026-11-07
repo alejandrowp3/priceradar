@@ -514,4 +514,329 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
       repoSession3.close();
     });
   });
+
+  describe("Adversarial Review Round 2 — F-P2-06, F-P2-07 & Out-of-Order Import Regressions", () => {
+    it("F-P2-06: replaying an existing observation after subsequent historical records must NOT generate new opportunities or supersede active opportunities", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      // 1. Original observation at T1 (2026-11-05T14:00:05.000Z) @ $45.000 — first observation ever (0 opportunities)
+      const obsT1 = makeProvisionalListing({
+        externalProductId: "2111457819",
+        observedPriceCop: 45_000,
+        sourceObservedAt: "2026-11-05T14:00:05.000Z",
+      });
+      const saveT1 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([obsT1], {
+          scanRunId: "scan-t1-original",
+          observedAtIso: "2026-11-05T14:00:05.000Z",
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(saveT1.observationsInserted).toBe(1);
+      expect(saveT1.opportunitiesInserted).toBe(0);
+
+      // 2. Earlier baseline observations T0a (2026-11-01 @ $65.000) and T0b (2026-11-02 @ $65.000) are imported,
+      //    followed by a newer observation T2 (2026-11-07 @ $39.900) which creates an ACTIVE HISTORICAL_LOW at $39.900
+      repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "2111457819",
+              observedPriceCop: 65_000,
+              sourceObservedAt: "2026-11-01T14:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-t0a", observedAtIso: "2026-11-01T14:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+      repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "2111457819",
+              observedPriceCop: 65_000,
+              sourceObservedAt: "2026-11-02T14:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-t0b", observedAtIso: "2026-11-02T14:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+
+      const saveT2 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "2111457819",
+              observedPriceCop: 39_900,
+              sourceObservedAt: "2026-11-07T14:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-t2-latest", observedAtIso: "2026-11-07T14:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+      expect(saveT2.observationsInserted).toBe(1);
+      expect(saveT2.opportunitiesInserted).toBe(1);
+
+      const activeBeforeReplay = repo.listDetectedOpportunities({
+        lifecycleStatus: "ACTIVE",
+      });
+      expect(activeBeforeReplay).toHaveLength(1);
+      expect(activeBeforeReplay[0]?.observedPriceCop).toBe(39_900);
+
+      // 3. Replay T1 ($45.000 at 2026-11-05T14:00:05.000Z or within same minute bucket 14:00:45.000Z)
+      //    with evaluationTimeIso 3 hours after T2 (outside cooldown window):
+      //    wasInserted is false -> MUST NOT create a new $45.000 opportunity and MUST NOT supersede T2's $39.900 opportunity!
+      const replayT1 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([obsT1], {
+          scanRunId: "scan-t1-replay",
+          observedAtIso: "2026-11-07T18:00:00.000Z",
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(replayT1.observationsInserted).toBe(0);
+      expect(replayT1.observationsSkippedDuplicate).toBe(1);
+      expect(replayT1.opportunitiesInserted).toBe(0);
+
+      const activeAfterReplay = repo.listDetectedOpportunities({
+        lifecycleStatus: "ACTIVE",
+      });
+      expect(activeAfterReplay).toHaveLength(1);
+      expect(activeAfterReplay[0]?.observedPriceCop).toBe(39_900);
+      expect(repo.getDatabaseStatus().counts.activeObservations).toBe(4);
+      expect(repo.getDatabaseStatus().counts.activeOpportunities).toBe(1);
+
+      repo.close();
+    });
+
+    it("Targeted Check #1: out-of-order historical imports cannot emit stale current alerts or supersede newer active opportunities", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      // Persist T0a (Nov 1 @ $65k), T0b (Nov 2 @ $65k), and T3 (Nov 7 @ $39.9k -> ACTIVE opportunity)
+      for (const [id, iso, price] of [
+        ["scan-nov1", "2026-11-01T14:00:00.000Z", 65_000],
+        ["scan-nov2", "2026-11-02T14:00:00.000Z", 65_000],
+        ["scan-nov7", "2026-11-07T14:00:00.000Z", 39_900],
+      ] as const) {
+        repo.persistApprovedInspectionBatch(
+          makeSupervisedBatchInput(
+            [
+              makeProvisionalListing({
+                externalProductId: "2111457819",
+                observedPriceCop: price,
+                sourceObservedAt: iso,
+              }),
+            ],
+            { scanRunId: id, observedAtIso: iso },
+          ),
+          { ownerConfirmed: true },
+        );
+      }
+
+      expect(repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" })).toHaveLength(
+        1,
+      );
+      expect(
+        repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" })[0]
+          ?.observedPriceCop,
+      ).toBe(39_900);
+
+      // Now import an out-of-order historical observation from Nov 4 @ $48.000 (older than Nov 7!)
+      const backfillNov4 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "2111457819",
+              observedPriceCop: 48_000,
+              sourceObservedAt: "2026-11-04T14:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-backfill-nov4", observedAtIso: "2026-11-08T10:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+
+      // The historical observation is recorded, but because a newer observation (Nov 7) already exists,
+      // the Nov 4 backfill must NOT emit a misleading current opportunity or supersede Nov 7's $39.900 opportunity
+      expect(backfillNov4.observationsInserted).toBe(1);
+      expect(backfillNov4.opportunitiesInserted).toBe(0);
+
+      const activeOpportunities = repo.listDetectedOpportunities({
+        lifecycleStatus: "ACTIVE",
+      });
+      expect(activeOpportunities).toHaveLength(1);
+      expect(activeOpportunities[0]?.observedPriceCop).toBe(39_900);
+
+      repo.close();
+    });
+
+    it("F-P2-07: enforces idempotent scan_run_id replay, preserves counters, rejects conflicting scan_run_id reuse, and recovers cleanly after partial failure", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      // Baseline history so scan-target creates 1 observation and 1 opportunity
+      for (const [id, iso] of [
+        ["scan-base-1", "2026-11-01T14:00:00.000Z"],
+        ["scan-base-2", "2026-11-02T14:00:00.000Z"],
+      ] as const) {
+        repo.persistApprovedInspectionBatch(
+          makeSupervisedBatchInput(
+            [
+              makeProvisionalListing({
+                externalProductId: "2111457819",
+                observedPriceCop: 65_000,
+                sourceObservedAt: iso,
+              }),
+            ],
+            { scanRunId: id, observedAtIso: iso },
+          ),
+          { ownerConfirmed: true },
+        );
+      }
+
+      const targetBatch = makeSupervisedBatchInput(
+        [
+          makeProvisionalListing({
+            externalProductId: "2111457819",
+            observedPriceCop: 39_900,
+            sourceObservedAt: "2026-11-07T14:00:00.000Z",
+          }),
+        ],
+        { scanRunId: "scan-target", observedAtIso: "2026-11-07T14:00:00.000Z" },
+      );
+
+      // 1. Partial-failure recovery: first attempt with scan-target crashes mid-transaction -> rolled back
+      const failedAttempt = repo.persistApprovedInspectionBatch(targetBatch, {
+        ownerConfirmed: true,
+        simulateCrashAfterObservationsInserted: 1,
+      });
+      expect(failedAttempt.persisted).toBe(false);
+      expect(failedAttempt.reason).toBe("TRANSACTION_FAILED");
+      expect(
+        repo.listRecentScanRuns().find((r) => r.scanRunId === "scan-target"),
+      ).toBeUndefined();
+
+      // 2. Retry same scan-target after transient failure -> succeeds cleanly with validObservations=1, opportunitiesCreated=1
+      const firstSuccess = repo.persistApprovedInspectionBatch(targetBatch, {
+        ownerConfirmed: true,
+      });
+      expect(firstSuccess.persisted).toBe(true);
+      expect(firstSuccess.observationsInserted).toBe(1);
+      expect(firstSuccess.opportunitiesInserted).toBe(1);
+
+      const runAfterSuccess = repo
+        .listRecentScanRuns()
+        .find((r) => r.scanRunId === "scan-target");
+      expect(runAfterSuccess?.status).toBe("SUCCEEDED");
+      expect(runAfterSuccess?.validObservations).toBe(1);
+      expect(runAfterSuccess?.opportunitiesCreated).toBe(1);
+      expect(runAfterSuccess?.duplicateRecords).toBe(0);
+
+      // 3. Identical replay with the SAME scan_run_id ("scan-target") -> idempotent no-op, MUST NOT overwrite validObservations=1 or opportunitiesCreated=1!
+      const identicalReplay = repo.persistApprovedInspectionBatch(targetBatch, {
+        ownerConfirmed: true,
+      });
+      expect(identicalReplay.persisted).toBe(true);
+      expect(identicalReplay.idempotentReplay).toBe(true);
+      expect(identicalReplay.reason).toBe("IDEMPOTENT_SCAN_RUN_REPLAY");
+      expect(identicalReplay.observationsInserted).toBe(0);
+      expect(identicalReplay.opportunitiesInserted).toBe(0);
+
+      const runAfterIdenticalReplay = repo
+        .listRecentScanRuns()
+        .find((r) => r.scanRunId === "scan-target");
+      expect(runAfterIdenticalReplay?.status).toBe("SUCCEEDED");
+      expect(runAfterIdenticalReplay?.validObservations).toBe(1);
+      expect(runAfterIdenticalReplay?.opportunitiesCreated).toBe(1);
+      expect(runAfterIdenticalReplay?.duplicateRecords).toBe(0);
+
+      // 4. Conflicting replay with the SAME scan_run_id ("scan-target") but different batch data -> rejected without modifying scan-target!
+      const conflictingBatch = makeSupervisedBatchInput(
+        [
+          makeProvisionalListing({
+            externalProductId: "9999999999",
+            name: "Producto Conflicto",
+            observedPriceCop: 12_000,
+            sourceObservedAt: "2026-11-08T14:00:00.000Z",
+          }),
+        ],
+        { scanRunId: "scan-target", observedAtIso: "2026-11-08T14:00:00.000Z" },
+      );
+      const conflictingResult = repo.persistApprovedInspectionBatch(conflictingBatch, {
+        ownerConfirmed: true,
+      });
+      expect(conflictingResult.persisted).toBe(false);
+      expect(conflictingResult.reason).toBe("CONFLICTING_SCAN_RUN_ID");
+      expect(repo.getProductPriceHistory("9999999999")).toHaveLength(0);
+
+      const runAfterConflict = repo
+        .listRecentScanRuns()
+        .find((r) => r.scanRunId === "scan-target");
+      expect(runAfterConflict?.status).toBe("SUCCEEDED");
+      expect(runAfterConflict?.validObservations).toBe(1);
+      expect(runAfterConflict?.opportunitiesCreated).toBe(1);
+
+      repo.close();
+    });
+
+    it("F-P2-06: supports explicit reevaluateLatestListingOpportunities as a separate operation after historical backfills", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      // 1. Latest observation T1 (Nov 7 @ $39.900) is saved first -> 0 prior history -> 0 opportunities
+      repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "2111457819",
+              observedPriceCop: 39_900,
+              sourceObservedAt: "2026-11-07T14:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-nov7-first", observedAtIso: "2026-11-07T14:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+
+      // 2. Backfill earlier observations Nov 1 ($65k) and Nov 2 ($65k) -> backfills do not implicitly emit alerts
+      for (const [id, iso] of [
+        ["scan-backfill-1", "2026-11-01T14:00:00.000Z"],
+        ["scan-backfill-2", "2026-11-02T14:00:00.000Z"],
+      ] as const) {
+        repo.persistApprovedInspectionBatch(
+          makeSupervisedBatchInput(
+            [
+              makeProvisionalListing({
+                externalProductId: "2111457819",
+                observedPriceCop: 65_000,
+                sourceObservedAt: iso,
+              }),
+            ],
+            { scanRunId: id, observedAtIso: iso },
+          ),
+          { ownerConfirmed: true },
+        );
+      }
+
+      expect(repo.listDetectedOpportunities({ lifecycleStatus: "ACTIVE" })).toHaveLength(
+        0,
+      );
+
+      // 3. Explicit separate reevaluation evaluates the chronologically latest observation (Nov 7 @ $39.900) against Nov 1 & Nov 2
+      const reeval = repo.reevaluateLatestListingOpportunities({
+        evaluationTimeIso: "2026-11-07T15:00:00.000Z",
+      });
+      expect(reeval.listingsEvaluated).toBe(1);
+      expect(reeval.opportunitiesInserted).toBe(1);
+
+      const activeAfterReeval = repo.listDetectedOpportunities({
+        lifecycleStatus: "ACTIVE",
+      });
+      expect(activeAfterReeval).toHaveLength(1);
+      expect(activeAfterReeval[0]?.observedPriceCop).toBe(39_900);
+      expect(activeAfterReeval[0]?.previousPriceCop).toBe(65_000);
+
+      repo.close();
+    });
+  });
 });
