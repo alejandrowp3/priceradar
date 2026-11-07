@@ -46,6 +46,36 @@ export const DEFAULT_PRICE_INTELLIGENCE_CONFIG: PriceIntelligenceConfig = {
 };
 
 /**
+ * Configuration for personal supervised session price history (`Phase P2`),
+ * allowing historical drop detection starting on the 3rd observation (`minHistoryForDrop: 2`)
+ * while keeping anomaly detection strictly gated at `>= 5` prior observations.
+ */
+export const PRIVATE_HISTORY_INTELLIGENCE_CONFIG: PriceIntelligenceConfig = {
+  minDeclaredDiscountBps: 1500, // 15%
+  minHistoricalDropBps: 1500, // 15%
+  minHistoricalLowBps: 1000, // 10%
+  minAnomalyDropBps: 4500, // 45%
+  minHistoryForDrop: 2,
+  minHistoryForAnomaly: 5,
+  maxBaselineAgeDays: 90,
+  cooldownMinutes: 120,
+};
+
+export type HistoricalPriceMovementKind =
+  "FIRST_OBSERVATION" | "UNCHANGED_PRICE" | "PRICE_INCREASE" | "PRICE_DECREASE";
+
+export interface HistoricalPriceComparisonSummary {
+  readonly movement: HistoricalPriceMovementKind;
+  readonly currentPriceCop: CopAmount;
+  readonly previousPriceCop?: CopAmount;
+  readonly baselineMedianCop?: CopAmount;
+  readonly absoluteDeltaCop: CopAmount;
+  readonly changeBasisPoints: number;
+  readonly changePercentageDecimal: number;
+  readonly priorObservationCount: number;
+}
+
+/**
  * Computes the deterministic integer median of a non-empty list of COP prices.
  * Uses integer floor division for even-length arrays to maintain strict integer COP invariants.
  */
@@ -152,29 +182,53 @@ export function evaluateListingOpportunities(
   const maxAgeMs = config.maxBaselineAgeDays * 24 * 60 * 60 * 1000;
 
   // Filter strictly to matching listingKey, matching provenance, strictly prior to current observation, and within freshness window
-  const priorObservations = input.historicalObservations.filter((obs) => {
-    if (obs.listingKey !== listingKey) {
-      return false;
+  const filteredPrior = input.historicalObservations
+    .filter((obs) => {
+      if (obs.listingKey !== listingKey) {
+        return false;
+      }
+      if (obs.provenance !== input.listing.provenance) {
+        return false;
+      }
+      if (obs.observedAt === input.listing.sourceObservedAt) {
+        return false;
+      }
+      const obsMs = Date.parse(obs.observedAt);
+      if (Number.isNaN(obsMs) || obsMs >= Date.parse(input.listing.sourceObservedAt)) {
+        return false;
+      }
+      if (!Number.isNaN(nowMs) && nowMs - obsMs > maxAgeMs) {
+        return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      const timeDiff = Date.parse(a.observedAt) - Date.parse(b.observedAt);
+      if (timeDiff !== 0) {
+        return timeDiff;
+      }
+      return a.observationId.localeCompare(b.observationId);
+    });
+
+  // Deduplicate identical (observedAt, observedPriceCop) entries so re-imported observations at the same timestamp do not inflate priorCount
+  const priorObservations: PriceObservationRecord[] = [];
+  const seenTimestampPricePairs = new Set<string>();
+  for (const obs of filteredPrior) {
+    const pairKey = `${obs.observedAt}::${String(obs.observedPriceCop)}`;
+    if (seenTimestampPricePairs.has(pairKey)) {
+      continue;
     }
-    if (obs.provenance !== input.listing.provenance) {
-      return false;
-    }
-    if (obs.observedAt === input.listing.sourceObservedAt) {
-      return false;
-    }
-    const obsMs = Date.parse(obs.observedAt);
-    if (Number.isNaN(obsMs) || obsMs >= Date.parse(input.listing.sourceObservedAt)) {
-      return false;
-    }
-    if (!Number.isNaN(nowMs) && nowMs - obsMs > maxAgeMs) {
-      return false;
-    }
-    return true;
-  });
+    seenTimestampPricePairs.add(pairKey);
+    priorObservations.push(obs);
+  }
 
   const priorPrices = priorObservations.map((obs) => obs.observedPriceCop);
   const priorCount = priorPrices.length;
   const currentPrice = input.listing.observedPriceCop;
+  const latestPrior = priorObservations[priorObservations.length - 1];
+  const previousPriceCop = latestPrior?.observedPriceCop;
+  const isUnchangedOrIncreasedFromPrevious =
+    previousPriceCop !== undefined && currentPrice >= previousPriceCop;
 
   const candidates: OpportunityCandidate[] = [];
 
@@ -191,6 +245,10 @@ export function evaluateListingOpportunities(
       ) {
         return false;
       }
+      // If price has not changed since the last observation, suppress duplicate event regardless of elapsed time
+      if (previousPriceCop !== undefined && previousPriceCop === currentPrice) {
+        return true;
+      }
       const existingMs = Date.parse(existing.detectedAt);
       if (Number.isNaN(existingMs) || Number.isNaN(nowMs)) {
         return true;
@@ -199,10 +257,10 @@ export function evaluateListingOpportunities(
     });
   };
 
-  // 1. Evaluate historical opportunities if sufficient prior observations exist.
+  // 1. Evaluate historical opportunities if sufficient prior observations exist AND price decreased vs immediately preceding observation.
   // Historical tiers (POTENTIAL_ANOMALY > HISTORICAL_LOW > HISTORICAL_DROP) are mutually exclusive
   // so a single price drop emits at most one historical classification.
-  if (priorCount >= config.minHistoryForDrop) {
+  if (priorCount >= config.minHistoryForDrop && !isUnchangedOrIncreasedFromPrevious) {
     const medianCop = computeMedianCop(priorPrices);
     const minCop = computeMinCop(priorPrices);
     const dropVsMedianBps = calculateDiscountBasisPoints(currentPrice, medianCop);
@@ -224,6 +282,7 @@ export function evaluateListingOpportunities(
           labelEsCo: OPPORTUNITY_LABELS_ES_CO[type],
           observedPriceCop: currentPrice,
           baselinePriceCop: medianCop,
+          ...(previousPriceCop !== undefined ? { previousPriceCop } : {}),
           savingsCop,
           discountBasisPoints: dropVsMedianBps,
           discountPercentage: pct,
@@ -250,6 +309,7 @@ export function evaluateListingOpportunities(
           labelEsCo: OPPORTUNITY_LABELS_ES_CO[type],
           observedPriceCop: currentPrice,
           baselinePriceCop: medianCop,
+          ...(previousPriceCop !== undefined ? { previousPriceCop } : {}),
           savingsCop,
           discountBasisPoints: dropVsMedianBps,
           discountPercentage: pct,
@@ -276,6 +336,7 @@ export function evaluateListingOpportunities(
           labelEsCo: OPPORTUNITY_LABELS_ES_CO[type],
           observedPriceCop: currentPrice,
           baselinePriceCop: medianCop,
+          ...(previousPriceCop !== undefined ? { previousPriceCop } : {}),
           savingsCop,
           discountBasisPoints: dropVsMedianBps,
           discountPercentage: pct,
@@ -321,6 +382,7 @@ export function evaluateListingOpportunities(
           labelEsCo: OPPORTUNITY_LABELS_ES_CO[type],
           observedPriceCop: currentPrice,
           baselinePriceCop: declaredRef,
+          ...(previousPriceCop !== undefined ? { previousPriceCop } : {}),
           savingsCop,
           discountBasisPoints: declaredBps,
           discountPercentage: pct,
@@ -338,4 +400,100 @@ export function evaluateListingOpportunities(
   }
 
   return candidates;
+}
+
+/**
+ * Deterministically compares a listing's current price against its prior persisted observations
+ * (strictly excluding the current observation timestamp and isolating by listingKey + provenance).
+ */
+export function compareObservationAgainstHistory(params: {
+  readonly listingKey: string;
+  readonly currentPriceCop: CopAmount;
+  readonly currentObservedAtIso: string;
+  readonly provenance: PriceObservationRecord["provenance"];
+  readonly historicalObservations: readonly PriceObservationRecord[];
+}): HistoricalPriceComparisonSummary {
+  const currentMs = Date.parse(params.currentObservedAtIso);
+  const prior = params.historicalObservations
+    .filter((obs) => {
+      if (obs.listingKey !== params.listingKey) return false;
+      if (obs.provenance !== params.provenance) return false;
+      const obsMs = Date.parse(obs.observedAt);
+      if (Number.isNaN(obsMs) || Number.isNaN(currentMs) || obsMs >= currentMs) {
+        return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      const diff = Date.parse(a.observedAt) - Date.parse(b.observedAt);
+      return diff !== 0 ? diff : a.observationId.localeCompare(b.observationId);
+    });
+
+  const deduplicatedPrior: PriceObservationRecord[] = [];
+  const seen = new Set<string>();
+  for (const obs of prior) {
+    const key = `${obs.observedAt}::${String(obs.observedPriceCop)}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduplicatedPrior.push(obs);
+    }
+  }
+
+  if (deduplicatedPrior.length === 0) {
+    return {
+      movement: "FIRST_OBSERVATION",
+      currentPriceCop: params.currentPriceCop,
+      absoluteDeltaCop: createCopAmount(0),
+      changeBasisPoints: 0,
+      changePercentageDecimal: 0,
+      priorObservationCount: 0,
+    };
+  }
+
+  const latestPrior = deduplicatedPrior[deduplicatedPrior.length - 1];
+  const previousPriceCop = latestPrior?.observedPriceCop ?? params.currentPriceCop;
+  const baselineMedianCop = computeMedianCop(
+    deduplicatedPrior.map((o) => o.observedPriceCop),
+  );
+
+  if (params.currentPriceCop === previousPriceCop) {
+    return {
+      movement: "UNCHANGED_PRICE",
+      currentPriceCop: params.currentPriceCop,
+      previousPriceCop,
+      baselineMedianCop,
+      absoluteDeltaCop: createCopAmount(0),
+      changeBasisPoints: 0,
+      changePercentageDecimal: 0,
+      priorObservationCount: deduplicatedPrior.length,
+    };
+  }
+
+  if (params.currentPriceCop < previousPriceCop) {
+    const delta = createCopAmount(previousPriceCop - params.currentPriceCop);
+    const bps = calculateDiscountBasisPoints(params.currentPriceCop, previousPriceCop);
+    return {
+      movement: "PRICE_DECREASE",
+      currentPriceCop: params.currentPriceCop,
+      previousPriceCop,
+      baselineMedianCop,
+      absoluteDeltaCop: delta,
+      changeBasisPoints: bps,
+      changePercentageDecimal: Number((bps / 100).toFixed(2)),
+      priorObservationCount: deduplicatedPrior.length,
+    };
+  }
+
+  const increaseDelta = createCopAmount(params.currentPriceCop - previousPriceCop);
+  const increaseBps = Math.round((increaseDelta * 10_000) / previousPriceCop);
+  return {
+    movement: "PRICE_INCREASE",
+    currentPriceCop: params.currentPriceCop,
+    previousPriceCop,
+    baselineMedianCop,
+    absoluteDeltaCop: increaseDelta,
+    changeBasisPoints: increaseBps,
+    changePercentageDecimal: Number((increaseBps / 100).toFixed(2)),
+    priorObservationCount: deduplicatedPrior.length,
+  };
 }

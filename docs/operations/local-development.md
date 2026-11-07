@@ -92,3 +92,59 @@ pnpm rappi:inspect -- --simulate-controlled-session
 # 4. Controlled simulation of an active delivery header with unverified static SEO catalog (rejected by F-P1-02):
 pnpm rappi:inspect -- --simulate-unverified-header-only
 ```
+
+---
+
+## 5. Phase P2 — Private Price History & Deal Detection (`pnpm history:cli`)
+
+Phase P2 persists eligible supervised Rappi storefront observations locally in SQLite (`~/.local/share/priceradar/private-history.sqlite`, directory `0700`, file `0600`, strictly outside the Git repository) after explicit owner confirmation.
+
+### 5.1 Supervised Inspection with Preview or Consent-Gated Persistence
+
+```bash
+# 1. Preview how an observed storefront compares against local SQLite history (read-only, 0 writes):
+pnpm rappi:inspect -- --persist-authorized-personal-profile --preview-history
+
+# 2. Inspect and prompt for explicit owner consent ('SI') before persisting to SQLite:
+pnpm rappi:inspect -- --persist-authorized-personal-profile --save
+```
+
+### 5.2 Private History Inspection CLI Commands
+
+```bash
+# Database status, permissions, schema version, and row counts:
+pnpm history:cli status
+
+# Recent supervised observation runs:
+pnpm history:cli runs
+
+# Chronological price history for a specific product ID, variant ID, or product name:
+pnpm history:cli product "Aceite de Oliva"
+
+# Active historical price drops and all-time lows (HISTORICAL_LOW, HISTORICAL_DROP):
+pnpm history:cli drops
+
+# Active potential pricing anomalies and declared discounts requiring manual verification:
+pnpm history:cli anomalies
+```
+
+### 5.3 Crash Recovery, Historical Corrections, and Local Backup / Restore
+
+1. **Atomic Batch Transactions & Crash Recovery:**
+   - Every batch save (`persistApprovedInspectionBatch`) executes inside a single `BEGIN IMMEDIATE ... COMMIT` SQLite WAL transaction covering `fulfillment_contexts`, `stores`, `scan_runs`, `products`, `price_observations`, and `opportunity_events`.
+   - If the process crashes or throws an error between observation insertion and opportunity creation, SQLite automatically rolls back the entire transaction on the next connection open (`0` partial rows or orphaned opportunities).
+2. **Non-Destructive Historical Corrections:**
+   - Wrong or anomalous historical observations are corrected via `markObservationSuperseded(observationId, reason)`, which sets `is_superseded = 1` and transitions any linked `ACTIVE` opportunity events to `SUPERSEDED` without destructively rewriting audit history.
+3. **Local Backup & Restore Procedure:**
+   - Always keep backups outside the Git repository with `0600` permissions:
+     ```bash
+     # Create an online consistent backup using SQLite's backup API:
+     sqlite3 "$HOME/.local/share/priceradar/private-history.sqlite" \
+       ".backup '$HOME/.local/share/priceradar/private-history.sqlite.bak'"
+     chmod 600 "$HOME/.local/share/priceradar/private-history.sqlite.bak"
+
+     # Restore from backup if needed:
+     cp -p "$HOME/.local/share/priceradar/private-history.sqlite.bak" \
+       "$HOME/.local/share/priceradar/private-history.sqlite"
+     chmod 600 "$HOME/.local/share/priceradar/private-history.sqlite"
+     ```

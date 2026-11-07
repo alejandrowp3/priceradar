@@ -6,6 +6,7 @@
   "scripts": {
     "scan": "node --experimental-strip-types src/cli.ts",
     "rappi:inspect": "node --experimental-strip-types src/rappi-inspect-cli.ts",
+    "history:cli": "node --experimental-strip-types src/private-history-cli.ts",
     "build": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

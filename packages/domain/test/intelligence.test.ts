@@ -3,11 +3,13 @@ import type { DiscoveredListing, PriceObservationRecord } from "../src/index.ts"
 import {
   buildCanonicalListingKey,
   calculateDiscountBasisPoints,
+  compareObservationAgainstHistory,
   computeMedianCop,
   createCopAmount,
   evaluateListingOpportunities,
   formatCop,
   OPPORTUNITY_LABELS_ES_CO,
+  PRIVATE_HISTORY_INTELLIGENCE_CONFIG,
 } from "../src/index.ts";
 
 const SAMPLE_LISTING: DiscoveredListing = {
@@ -349,5 +351,207 @@ describe("Price intelligence rules & anomaly classification (SC-007)", () => {
     expect(opportunities[0]?.provenance).toBe(
       "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
     );
+  });
+
+  it("Phase P2 Section 8 & 9: evaluates $65.000 -> $65.000 -> $39.900 with exact integer COP deltas and 38.62% drop", () => {
+    const oliveOilListing: DiscoveredListing = {
+      ...SAMPLE_LISTING,
+      provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      observedPriceCop: createCopAmount(39_900),
+      sourceObservedAt: "2026-11-07T15:00:00.000Z",
+    };
+    delete (oliveOilListing as { declaredReferencePriceCop?: unknown })
+      .declaredReferencePriceCop;
+
+    const listingKey = buildCanonicalListingKey({
+      providerId: oliveOilListing.providerId,
+      externalStoreId: oliveOilListing.store.externalStoreId,
+      externalProductId: oliveOilListing.variant.externalProductId,
+      externalVariantId: oliveOilListing.variant.externalVariantId,
+      citySlug: oliveOilListing.geographicContext.citySlug,
+    });
+
+    const history = [
+      makeObservation(65_000, "2026-11-05T15:00:00.000Z", {
+        observationId: "obs-1",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+      makeObservation(65_000, "2026-11-06T15:00:00.000Z", {
+        observationId: "obs-2",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+    ];
+
+    const comparison = compareObservationAgainstHistory({
+      listingKey,
+      currentPriceCop: oliveOilListing.observedPriceCop,
+      currentObservedAtIso: oliveOilListing.sourceObservedAt,
+      provenance: oliveOilListing.provenance,
+      historicalObservations: history,
+    });
+
+    expect(comparison.movement).toBe("PRICE_DECREASE");
+    expect(comparison.priorObservationCount).toBe(2);
+    expect(comparison.previousPriceCop).toBe(65_000);
+    expect(comparison.baselineMedianCop).toBe(65_000);
+    expect(comparison.absoluteDeltaCop).toBe(25_100);
+    expect(comparison.changeBasisPoints).toBe(3862);
+    expect(comparison.changePercentageDecimal).toBe(38.62);
+
+    const opportunities = evaluateListingOpportunities({
+      listing: oliveOilListing,
+      historicalObservations: history,
+      config: PRIVATE_HISTORY_INTELLIGENCE_CONFIG,
+    });
+
+    expect(opportunities).toHaveLength(1);
+    expect(opportunities[0]?.type).toBe("HISTORICAL_LOW");
+    expect(opportunities[0]?.savingsCop).toBe(25_100);
+    expect(opportunities[0]?.discountBasisPoints).toBe(3862);
+    expect(opportunities[0]?.discountPercentage).toBe(39);
+    expect(opportunities[0]?.previousPriceCop).toBe(65_000);
+  });
+
+  it("Phase P2 Section 9: distinguishes FIRST_OBSERVATION, UNCHANGED_PRICE, and PRICE_INCREASE without false discount alerts", () => {
+    const baseListing: DiscoveredListing = {
+      ...SAMPLE_LISTING,
+      provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      observedPriceCop: createCopAmount(65_000),
+      sourceObservedAt: "2026-11-07T15:00:00.000Z",
+    };
+    delete (baseListing as { declaredReferencePriceCop?: unknown })
+      .declaredReferencePriceCop;
+
+    const listingKey = buildCanonicalListingKey({
+      providerId: baseListing.providerId,
+      externalStoreId: baseListing.store.externalStoreId,
+      externalProductId: baseListing.variant.externalProductId,
+      externalVariantId: baseListing.variant.externalVariantId,
+      citySlug: baseListing.geographicContext.citySlug,
+    });
+
+    // 1. First observation
+    const first = compareObservationAgainstHistory({
+      listingKey,
+      currentPriceCop: baseListing.observedPriceCop,
+      currentObservedAtIso: baseListing.sourceObservedAt,
+      provenance: baseListing.provenance,
+      historicalObservations: [],
+    });
+    expect(first.movement).toBe("FIRST_OBSERVATION");
+    expect(first.priorObservationCount).toBe(0);
+    expect(
+      evaluateListingOpportunities({
+        listing: baseListing,
+        historicalObservations: [],
+        config: PRIVATE_HISTORY_INTELLIGENCE_CONFIG,
+      }),
+    ).toHaveLength(0);
+
+    // 2. Unchanged price (even if older prices were higher, if current == immediately preceding price, no new historical drop fires)
+    const unchangedHistory = [
+      makeObservation(80_000, "2026-11-04T15:00:00.000Z", {
+        observationId: "obs-1",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+      makeObservation(80_000, "2026-11-05T15:00:00.000Z", {
+        observationId: "obs-2",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+      makeObservation(65_000, "2026-11-06T15:00:00.000Z", {
+        observationId: "obs-3",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+    ];
+    const unchanged = compareObservationAgainstHistory({
+      listingKey,
+      currentPriceCop: baseListing.observedPriceCop,
+      currentObservedAtIso: baseListing.sourceObservedAt,
+      provenance: baseListing.provenance,
+      historicalObservations: unchangedHistory,
+    });
+    expect(unchanged.movement).toBe("UNCHANGED_PRICE");
+    expect(unchanged.absoluteDeltaCop).toBe(0);
+    expect(
+      evaluateListingOpportunities({
+        listing: baseListing,
+        historicalObservations: unchangedHistory,
+        config: PRIVATE_HISTORY_INTELLIGENCE_CONFIG,
+      }),
+    ).toHaveLength(0);
+
+    // 3. Price increase vs previous observation
+    const increasedListing: DiscoveredListing = {
+      ...baseListing,
+      observedPriceCop: createCopAmount(72_000),
+    };
+    const increased = compareObservationAgainstHistory({
+      listingKey,
+      currentPriceCop: increasedListing.observedPriceCop,
+      currentObservedAtIso: increasedListing.sourceObservedAt,
+      provenance: increasedListing.provenance,
+      historicalObservations: unchangedHistory,
+    });
+    expect(increased.movement).toBe("PRICE_INCREASE");
+    expect(increased.absoluteDeltaCop).toBe(7_000);
+    expect(
+      evaluateListingOpportunities({
+        listing: increasedListing,
+        historicalObservations: unchangedHistory,
+        config: PRIVATE_HISTORY_INTELLIGENCE_CONFIG,
+      }),
+    ).toHaveLength(0);
+  });
+
+  it("Phase P2 Section 8: handles out-of-order observations and identical timestamps deterministically", () => {
+    const listing: DiscoveredListing = {
+      ...SAMPLE_LISTING,
+      provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      observedPriceCop: createCopAmount(39_900),
+      sourceObservedAt: "2026-11-07T18:00:00.000Z",
+    };
+    delete (listing as { declaredReferencePriceCop?: unknown }).declaredReferencePriceCop;
+
+    const listingKey = buildCanonicalListingKey({
+      providerId: listing.providerId,
+      externalStoreId: listing.store.externalStoreId,
+      externalProductId: listing.variant.externalProductId,
+      externalVariantId: listing.variant.externalVariantId,
+      citySlug: listing.geographicContext.citySlug,
+    });
+
+    // Out of chronological order + duplicate identical (timestamp, price) entry + tie-broken same timestamp
+    const unorderedHistory = [
+      makeObservation(65_000, "2026-11-06T10:00:00.000Z", {
+        observationId: "obs-b",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+      makeObservation(60_000, "2026-11-06T10:00:00.000Z", {
+        observationId: "obs-a",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+      makeObservation(65_000, "2026-11-06T10:00:00.000Z", {
+        observationId: "obs-b-dup",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+      makeObservation(70_000, "2026-11-01T10:00:00.000Z", {
+        observationId: "obs-0",
+        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL",
+      }),
+    ];
+
+    const comparison = compareObservationAgainstHistory({
+      listingKey,
+      currentPriceCop: listing.observedPriceCop,
+      currentObservedAtIso: listing.sourceObservedAt,
+      provenance: listing.provenance,
+      historicalObservations: unorderedHistory,
+    });
+
+    // Deduplicated count is 3 (2026-11-01@70k, 2026-11-06@60k [obs-a], 2026-11-06@65k [obs-b])
+    expect(comparison.priorObservationCount).toBe(3);
+    // Because obs-b sorts after obs-a at the identical timestamp, previousPriceCop is 65_000
+    expect(comparison.previousPriceCop).toBe(65_000);
+    expect(comparison.baselineMedianCop).toBe(65_000);
   });
 });
