@@ -34,6 +34,12 @@ export const DEFAULT_PRIVATE_SQLITE_DB_PATH = path.join(
 
 const OPAQUE_CONTEXT_ID_REGEX = /^ctx-[0-9a-f]{16}$/;
 
+/**
+ * Legacy catch-all patterns, still applied to unclassified free-text fields
+ * (`assertNoSensitiveTextInPersistedString`). Product names, packaging labels and URLs use the
+ * field-aware rules below, because words such as "Casa", "Torre", "Bloque" or "Manzana"
+ * followed by a quantity are legitimate grocery labels ("Manzana 6 unidades").
+ */
 const FORBIDDEN_PII_OR_CREDENTIAL_PATTERNS = [
   /\b(?:calle|carrera|diagonal|transversal|avenida|autopista|circular)\s+\d+/i,
   /\b(?:apto|apartamento|interior|torre|bloque|manzana|casa)\s*#?\s*\d+/i,
@@ -42,6 +48,194 @@ const FORBIDDEN_PII_OR_CREDENTIAL_PATTERNS = [
   /\bbearer\s+[a-z0-9._~+/-]+=*/i,
   /\b(?:session_id|access_token|refresh_token|cf_clearance|__cf_bm)\s*=/i,
 ];
+
+/** Field classes with distinct privacy semantics (`P2 hotfix`). */
+export type PersistedFieldClass =
+  /** Unclassified text that might hold a delivery address or personal data: strictest rules. */
+  | "FREE_TEXT"
+  /** Product name, brand, packaging label, store name: may legitimately contain casa/torre/bloque/manzana + number. */
+  | "PRODUCT_LABEL"
+  /** Canonical product URL: digits are legitimate; query strings must not carry auth material. */
+  | "PRODUCT_URL"
+  /** Strict provider/store/product/variant identifier. */
+  | "STRICT_ID"
+  /** Opaque fulfillment-context identifier (`ctx-<16 hex>`). */
+  | "OPAQUE_CONTEXT_ID"
+  /** City slug. */
+  | "SLUG";
+
+export class PrivacyViolationError extends Error {
+  public readonly fieldName: string;
+  public readonly fieldClass: PersistedFieldClass;
+  public readonly ruleId: string;
+  public readonly subject: string | undefined;
+
+  public constructor(
+    fieldName: string,
+    fieldClass: PersistedFieldClass,
+    ruleId: string,
+    subject?: string,
+  ) {
+    // Never include the matched substring: only field, class, rule id and an opaque subject.
+    super(
+      `Privacy violation prevented: field '${fieldName}' matched forbidden PII or credential pattern (rule=${ruleId}, class=${fieldClass}${subject !== undefined ? `, subject=${subject}` : ""}).`,
+    );
+    this.name = "PrivacyViolationError";
+    this.fieldName = fieldName;
+    this.fieldClass = fieldClass;
+    this.ruleId = ruleId;
+    this.subject = subject;
+  }
+}
+
+interface PrivacyRule {
+  readonly id: string;
+  readonly test: (value: string) => boolean;
+}
+
+const STREET_DESIGNATOR =
+  "(?:calle|cll|cl|carrera|cra|cr|kra|diagonal|diag|dg|transversal|tv|avenida|av|autopista|circular)";
+const UNIT_DESIGNATOR_WITH_NUMBER =
+  /\b(torre|bloque|manzana|casa|interior|apto|apartamento)\.?\s*#?\s*\d+/gi;
+
+/** Authentication / session material: must never be persisted in ANY field. */
+const AUTH_MATERIAL_RULES: readonly PrivacyRule[] = [
+  { id: "AUTH_BEARER_TOKEN", test: (v) => /\bbearer\s+[a-z0-9._~+/-]+=*/i.test(v) },
+  {
+    id: "AUTH_SESSION_ASSIGNMENT",
+    test: (v) =>
+      /\b(?:session_?id|access_token|refresh_token|id_token|cf_clearance|__cf_bm)\s*=/i.test(
+        v,
+      ),
+  },
+  {
+    id: "AUTH_JWT",
+    test: (v) => /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/.test(v),
+  },
+];
+
+const EMAIL_RULE: PrivacyRule = {
+  id: "PII_EMAIL",
+  test: (v) => /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/i.test(v),
+};
+
+const PHONE_RULE: PrivacyRule = {
+  id: "PII_PHONE",
+  test: (v) => /\b(?:\+?57[\s-]?)?3\d{2}[\s-]?\d{3}[\s-]?\d{4}\b/.test(v),
+};
+
+const LONG_SECRET_RULE: PrivacyRule = {
+  id: "AUTH_LONG_OPAQUE_SECRET",
+  test: (v) =>
+    /(?=[A-Za-z0-9+/_=]*\d)(?=[A-Za-z0-9+/_=]*[A-Za-z])[A-Za-z0-9+/_=]{40,}/.test(v),
+};
+
+/** Plausible full address / unit designation for product labels (not bare "Casa 12"). */
+const LABEL_ADDRESS_RULES: readonly PrivacyRule[] = [
+  {
+    id: "ADDRESS_STREET_COMPLETE",
+    test: (v) =>
+      new RegExp(
+        `\\b${STREET_DESIGNATOR}\\.?\\s*\\d+\\s*[a-z]?(?:\\s*(?:bis|sur|norte|este|oeste))?\\s*(?:(?:#|no\\.?|nro\\.?|n°|nº)\\s*\\d+|\\d+\\s*-\\s*\\d+)`,
+        "i",
+      ).test(v),
+  },
+  {
+    id: "ADDRESS_STREET_CROSS",
+    test: (v) =>
+      new RegExp(
+        `\\b${STREET_DESIGNATOR}\\.?\\s*\\d+\\s*[a-z]?\\s+(?:con|entre|esq\\.?)\\s+${STREET_DESIGNATOR}\\.?\\s*\\d+`,
+        "i",
+      ).test(v),
+  },
+  {
+    id: "ADDRESS_APARTMENT_UNIT",
+    test: (v) => /\b(?:apto|apartamento|apt)\.?\s*#?\s*\d+/i.test(v),
+  },
+  {
+    id: "ADDRESS_MULTIPLE_UNIT_DESIGNATORS",
+    test: (v) => {
+      const seen = new Set<string>();
+      for (const match of v.matchAll(UNIT_DESIGNATOR_WITH_NUMBER)) {
+        seen.add((match[1] ?? "").toLowerCase());
+      }
+      return seen.size >= 2;
+    },
+  },
+];
+
+const STRICT_ID_REGEX = /^[\p{L}\p{N}][\p{L}\p{N}._:~-]{0,199}$/u;
+const SLUG_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const SENSITIVE_QUERY_PARAM_REGEX =
+  /(?:token|session|sess|auth|cookie|secret|passw|pwd|jwt|bearer|credential|api[_-]?key|sid|signature)/i;
+
+function firstViolatedRule(
+  value: string,
+  rules: readonly PrivacyRule[],
+): string | undefined {
+  return rules.find((rule) => rule.test(value))?.id;
+}
+
+function classifyViolation(
+  value: string,
+  fieldClass: PersistedFieldClass,
+): string | undefined {
+  switch (fieldClass) {
+    case "OPAQUE_CONTEXT_ID":
+      return OPAQUE_CONTEXT_ID_REGEX.test(value) ? undefined : "CONTEXT_ID_NOT_OPAQUE";
+    case "SLUG":
+      return (
+        firstViolatedRule(value, [...AUTH_MATERIAL_RULES, EMAIL_RULE]) ??
+        (SLUG_REGEX.test(value) && value.length <= 64 ? undefined : "SLUG_INVALID_FORMAT")
+      );
+    case "STRICT_ID":
+      return (
+        firstViolatedRule(value, [...AUTH_MATERIAL_RULES, EMAIL_RULE]) ??
+        (STRICT_ID_REGEX.test(value) ? undefined : "ID_INVALID_FORMAT")
+      );
+    case "PRODUCT_URL": {
+      let parsed: URL;
+      try {
+        parsed = new URL(value, "https://www.rappi.com.co");
+      } catch {
+        return "URL_MALFORMED";
+      }
+      if (parsed.protocol !== "https:") return "URL_NOT_HTTPS";
+      if (parsed.username !== "" || parsed.password !== "")
+        return "URL_EMBEDDED_CREDENTIALS";
+      let decoded = value;
+      try {
+        decoded = decodeURIComponent(value);
+      } catch {
+        // keep raw value for scanning
+      }
+      const credentialRule = firstViolatedRule(decoded, [
+        ...AUTH_MATERIAL_RULES,
+        EMAIL_RULE,
+      ]);
+      if (credentialRule) return credentialRule;
+      for (const key of parsed.searchParams.keys()) {
+        if (SENSITIVE_QUERY_PARAM_REGEX.test(key)) return "URL_SENSITIVE_QUERY_PARAMETER";
+      }
+      return undefined;
+    }
+    case "PRODUCT_LABEL":
+      return firstViolatedRule(value, [
+        ...AUTH_MATERIAL_RULES,
+        LONG_SECRET_RULE,
+        EMAIL_RULE,
+        PHONE_RULE,
+        ...LABEL_ADDRESS_RULES,
+      ]);
+    case "FREE_TEXT": {
+      const legacy = FORBIDDEN_PII_OR_CREDENTIAL_PATTERNS.findIndex((p) => p.test(value));
+      return (
+        firstViolatedRule(value, [...AUTH_MATERIAL_RULES, LONG_SECRET_RULE]) ??
+        (legacy >= 0 ? `LEGACY_FREE_TEXT_PATTERN_${String(legacy + 1)}` : undefined)
+      );
+    }
+  }
+}
 
 export type GeographicVerificationVerdictType =
   | "VERIFIED_ADDRESS_SPECIFIC_PRICING"
@@ -247,21 +441,46 @@ export interface PrivateDatabaseStatusSummary {
 }
 
 /**
+ * Builds a diagnostic subject for privacy failures: the product index plus the external product
+ * id only when it is itself strictly well-formed (so no sensitive text can leak through the id).
+ */
+function buildOpaqueProductSubject(index: number, externalProductId: string): string {
+  const base = `product-index=${String(index)}`;
+  return STRICT_ID_REGEX.test(externalProductId) &&
+    !firstViolatedRule(externalProductId, [...AUTH_MATERIAL_RULES, EMAIL_RULE])
+    ? `${base},product-id=${externalProductId}`
+    : base;
+}
+
+/**
  * Verifies that a string about to be written to the private SQLite database
  * does not contain raw street addresses, apartment numbers, emails, phone numbers,
  * bearer tokens, or session cookies (`Section 5 & Section 14`).
+ *
+ * Unclassified fields are treated as `FREE_TEXT` (strictest legacy behavior).
+ * Use `assertPersistedFieldSafe` for field-aware validation.
  */
 export function assertNoSensitiveTextInPersistedString(
   value: string | undefined,
   fieldName: string,
 ): void {
+  assertPersistedFieldSafe(value, fieldName, "FREE_TEXT");
+}
+
+/**
+ * Field-aware privacy validation. Throws `PrivacyViolationError` carrying only the field name,
+ * field class, rule identifier and an optional opaque subject — never the matched text.
+ */
+export function assertPersistedFieldSafe(
+  value: string | undefined,
+  fieldName: string,
+  fieldClass: PersistedFieldClass,
+  subject?: string,
+): void {
   if (!value) return;
-  for (const pattern of FORBIDDEN_PII_OR_CREDENTIAL_PATTERNS) {
-    if (pattern.test(value)) {
-      throw new Error(
-        `Privacy violation prevented: field '${fieldName}' matched forbidden PII or credential pattern.`,
-      );
-    }
+  const ruleId = classifyViolation(value, fieldClass);
+  if (ruleId !== undefined) {
+    throw new PrivacyViolationError(fieldName, fieldClass, ruleId, subject);
   }
 }
 
@@ -1188,9 +1407,9 @@ export class SqlitePrivateHistoryRepository {
       effectiveVerdict,
     );
 
-    assertNoSensitiveTextInPersistedString(contextHash, "fulfillmentContextHash");
-    assertNoSensitiveTextInPersistedString(context.citySlug, "citySlug");
-    assertNoSensitiveTextInPersistedString(context.cityName, "cityName");
+    assertPersistedFieldSafe(contextHash, "fulfillmentContextHash", "OPAQUE_CONTEXT_ID");
+    assertPersistedFieldSafe(context.citySlug, "citySlug", "SLUG");
+    assertPersistedFieldSafe(context.cityName, "cityName", "FREE_TEXT");
 
     let observationsInserted = 0;
     let observationsSkippedDuplicate = 0;
@@ -1333,11 +1552,12 @@ export class SqlitePrivateHistoryRepository {
           );
 
         // 2. Upsert stores
-        assertNoSensitiveTextInPersistedString(
+        assertPersistedFieldSafe(
           firstListing.store.externalStoreId,
           "externalStoreId",
+          "STRICT_ID",
         );
-        assertNoSensitiveTextInPersistedString(firstListing.store.name, "storeName");
+        assertPersistedFieldSafe(firstListing.store.name, "storeName", "PRODUCT_LABEL");
 
         this.db
           .prepare(
@@ -1497,17 +1717,52 @@ export class SqlitePrivateHistoryRepository {
              )`,
         );
 
-        for (const rawListing of context.listings) {
+        for (const [listingIndex, rawListing] of context.listings.entries()) {
           const validatedPrice = createCopAmount(rawListing.observedPriceCop);
           const validatedRefPrice =
             rawListing.declaredReferencePriceCop !== undefined
               ? createCopAmount(rawListing.declaredReferencePriceCop)
               : null;
 
-          assertNoSensitiveTextInPersistedString(rawListing.variant.name, "productName");
-          assertNoSensitiveTextInPersistedString(
+          const subject = buildOpaqueProductSubject(
+            listingIndex,
+            rawListing.variant.externalProductId,
+          );
+          assertPersistedFieldSafe(
+            rawListing.variant.externalProductId,
+            "externalProductId",
+            "STRICT_ID",
+            `product-index=${String(listingIndex)}`,
+          );
+          assertPersistedFieldSafe(
+            rawListing.variant.externalVariantId,
+            "externalVariantId",
+            "STRICT_ID",
+            subject,
+          );
+          assertPersistedFieldSafe(
+            rawListing.variant.name,
+            "productName",
+            "PRODUCT_LABEL",
+            subject,
+          );
+          assertPersistedFieldSafe(
+            rawListing.variant.packagingLabel,
+            "packagingLabel",
+            "PRODUCT_LABEL",
+            subject,
+          );
+          assertPersistedFieldSafe(
+            rawListing.variant.brand,
+            "brand",
+            "PRODUCT_LABEL",
+            subject,
+          );
+          assertPersistedFieldSafe(
             rawListing.variant.productUrl,
             "productUrl",
+            "PRODUCT_URL",
+            subject,
           );
 
           const productVariantKey = `${rawListing.providerId}::${rawListing.variant.externalProductId}::${rawListing.variant.externalVariantId}`;
