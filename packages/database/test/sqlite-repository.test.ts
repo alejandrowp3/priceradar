@@ -9,6 +9,7 @@ import type { SupervisedPersistenceContextInput } from "../src/index.ts";
 import {
   assertDatabasePathOutsideRepository,
   assertNoSensitiveTextInPersistedString,
+  assertPersistedFieldSafe,
   computeScanBatchFingerprint,
   SqlitePrivateHistoryRepository,
 } from "../src/index.ts";
@@ -1435,6 +1436,247 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
         expect(terminalRows.map((o) => o.opportunityId)).toEqual([eventAId]);
         repo.close();
       }
+    });
+  });
+
+  describe("P2 Hotfix — field-aware privacy validation (product-name false positive)", () => {
+    const LEGIT_NAMES = [
+      "Manzana 6 unidades",
+      "Manzana Roja x 6 und",
+      "Casa 12 Chocolate Premium",
+      "Café Casa 12 Onzas",
+      "Torre 5 Galletas Surtidas",
+      "Bloque 3 Queso Mozzarella",
+      "Interior 2 Piezas de Pollo",
+      "Pack 3 Jabón Rey 300 g",
+    ] as const;
+
+    function withUrl(listing: DiscoveredListing, productUrl: string): DiscoveredListing {
+      return { ...listing, variant: { ...listing.variant, productUrl } };
+    }
+
+    function fictionalBatch(count: number): DiscoveredListing[] {
+      return Array.from({ length: count }, (_, i) =>
+        makeProvisionalListing({
+          externalProductId: `fx-${String(1000 + i)}`,
+          externalVariantId: `fx-${String(1000 + i)}-500g`,
+          name:
+            i % 7 === 0
+              ? `Manzana ${String((i % 9) + 1)} unidades fixture`
+              : `Producto Ficticio ${String(i)}`,
+          packagingLabel: i % 5 === 0 ? "Bloque 3 x 500 g" : "500 g",
+          unitQuantity: 500,
+          unitType: "g",
+          observedPriceCop: 5_000 + i * 100,
+        }),
+      );
+    }
+
+    it("accepts legitimate grocery names and packaging labels containing casa/torre/bloque/manzana + number", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+      const listings = LEGIT_NAMES.map((name, i) =>
+        makeProvisionalListing({
+          externalProductId: `legit-${String(i)}`,
+          externalVariantId: `legit-${String(i)}-1unit`,
+          name,
+          packagingLabel: "Manzana x 6 und",
+          unitType: "unit",
+          unitQuantity: 6,
+        }),
+      );
+      const result = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(listings, { scanRunId: "scan-legit-names" }),
+        { ownerConfirmed: true },
+      );
+      expect(result.errorSummary).toBeUndefined();
+      expect(result.persisted).toBe(true);
+      expect(result.observationsInserted).toBe(LEGIT_NAMES.length);
+      repo.close();
+    });
+
+    it("persists an eligible 73-product fictional batch atomically and preserves it after reopening SQLite", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+      const batch = makeSupervisedBatchInput(fictionalBatch(73), {
+        scanRunId: "scan-73-fixture",
+      });
+      const result = repo.persistApprovedInspectionBatch(batch, { ownerConfirmed: true });
+      expect(result.errorSummary).toBeUndefined();
+      expect(result.persisted).toBe(true);
+      expect(result.observationsInserted).toBe(73);
+      expect(repo.getDatabaseStatus().counts.activeObservations).toBe(73);
+      repo.close();
+
+      const reopened = new SqlitePrivateHistoryRepository(dbPath);
+      expect(reopened.getDatabaseStatus().counts.activeObservations).toBe(73);
+      const replay = reopened.persistApprovedInspectionBatch(batch, {
+        ownerConfirmed: true,
+      });
+      expect(replay.idempotentReplay).toBe(true);
+      reopened.close();
+    });
+
+    it("rejects an explicit delivery address in a product name without partial writes and without leaking the matched text", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+      const listings = fictionalBatch(73);
+      listings[40] = makeProvisionalListing({
+        externalProductId: "fx-unsafe",
+        externalVariantId: "fx-unsafe-1unit",
+        name: "Entrega en Calle 85 # 15-20 Apto 402",
+      });
+      const result = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(listings, { scanRunId: "scan-unsafe-address" }),
+        { ownerConfirmed: true },
+      );
+      expect(result.persisted).toBe(false);
+      expect(result.reason).toBe("TRANSACTION_FAILED");
+      expect(result.errorSummary).toMatch(/field 'productName'/);
+      expect(result.errorSummary).toMatch(/rule=ADDRESS_/);
+      expect(result.errorSummary).toMatch(/subject=product-index=40/);
+      expect(result.errorSummary).not.toMatch(/85|15-20|402|Calle/i);
+      const counts = repo.getDatabaseStatus().counts;
+      expect(counts.activeObservations).toBe(0);
+      expect(counts.scanRuns).toBe(0);
+      expect(counts.products).toBe(0);
+      repo.close();
+    });
+
+    it("rejects credentials, session tokens and emails in labels and URLs, and validates packaging labels too", () => {
+      const base = makeProvisionalListing({
+        externalProductId: "cred-1",
+        externalVariantId: "cred-1-1unit",
+      });
+      const unsafeListings: Array<[string, DiscoveredListing, RegExp]> = [
+        [
+          "token in name",
+          makeProvisionalListing({
+            externalProductId: "cred-2",
+            externalVariantId: "cred-2-1unit",
+            name: "Leche Bearer abcdefghijklmnop",
+          }),
+          /rule=AUTH_BEARER_TOKEN/,
+        ],
+        [
+          "session assignment in name",
+          makeProvisionalListing({
+            externalProductId: "cred-3",
+            externalVariantId: "cred-3-1unit",
+            name: "Arroz cf_clearance=abc123",
+          }),
+          /rule=AUTH_SESSION_ASSIGNMENT/,
+        ],
+        [
+          "email in packaging label",
+          makeProvisionalListing({
+            externalProductId: "cred-4",
+            externalVariantId: "cred-4-1unit",
+            packagingLabel: "dueno@example.com",
+          }),
+          /field 'packagingLabel'.*rule=PII_EMAIL/,
+        ],
+        [
+          "token in URL query",
+          withUrl(base, "https://www.rappi.com.co/p/leche-1?access_token=abc"),
+          /field 'productUrl'.*rule=AUTH_SESSION_ASSIGNMENT/,
+        ],
+        [
+          "benign-looking sensitive query parameter",
+          withUrl(base, "https://www.rappi.com.co/p/leche-1?session=abc"),
+          /rule=URL_SENSITIVE_QUERY_PARAMETER/,
+        ],
+        [
+          "credentials in URL authority",
+          withUrl(base, "https://user:pass@www.rappi.com.co/p/leche-1"),
+          /rule=URL_EMBEDDED_CREDENTIALS/,
+        ],
+      ];
+      let n = 0;
+      for (const [label, listing, expected] of unsafeListings) {
+        n += 1;
+        const repo = new SqlitePrivateHistoryRepository(
+          path.join(tempDir, `cred-${String(n)}`, "h.sqlite"),
+        );
+        const result = repo.persistApprovedInspectionBatch(
+          makeSupervisedBatchInput([listing], { scanRunId: `scan-cred-${String(n)}` }),
+          { ownerConfirmed: true },
+        );
+        expect(result.persisted, label).toBe(false);
+        expect(result.errorSummary, label).toMatch(expected);
+        expect(repo.getDatabaseStatus().counts.activeObservations, label).toBe(0);
+        repo.close();
+      }
+    });
+
+    it("accepts legitimate URLs whose path contains 10-digit ids starting with 3 and never treats them as phone numbers", () => {
+      expect(() =>
+        assertPersistedFieldSafe(
+          "https://www.rappi.com.co/p/leche-3101234567",
+          "productUrl",
+          "PRODUCT_URL",
+        ),
+      ).not.toThrow();
+      expect(() =>
+        assertPersistedFieldSafe("3101234567-500g", "externalVariantId", "STRICT_ID"),
+      ).not.toThrow();
+    });
+
+    it("keeps strict validation for free text, ids and opaque context identifiers", () => {
+      for (const risky of ["Calle 85 # 15-20 Apto 402", "Torre 5", "Casa 12"]) {
+        expect(() => assertPersistedFieldSafe(risky, "note", "FREE_TEXT")).toThrow(
+          /Privacy violation prevented/,
+        );
+      }
+      expect(() =>
+        assertPersistedFieldSafe("Carrera 11 # 93-10", "productName", "PRODUCT_LABEL"),
+      ).toThrow(/rule=ADDRESS_STREET_COMPLETE/);
+      expect(() =>
+        assertPersistedFieldSafe(
+          "Calle 72 con Carrera 10",
+          "productName",
+          "PRODUCT_LABEL",
+        ),
+      ).toThrow(/rule=ADDRESS_STREET_CROSS/);
+      expect(() =>
+        assertPersistedFieldSafe("Manzana 6 Casa 12", "productName", "PRODUCT_LABEL"),
+      ).toThrow(/rule=ADDRESS_MULTIPLE_UNIT_DESIGNATORS/);
+      expect(() =>
+        assertPersistedFieldSafe("+57 310 555 1234", "productName", "PRODUCT_LABEL"),
+      ).toThrow(/rule=PII_PHONE/);
+      expect(() =>
+        assertPersistedFieldSafe("owner@example.com", "externalProductId", "STRICT_ID"),
+      ).toThrow(/rule=PII_EMAIL/);
+      expect(() =>
+        assertPersistedFieldSafe("has space", "externalProductId", "STRICT_ID"),
+      ).toThrow(/rule=ID_INVALID_FORMAT/);
+      expect(() =>
+        assertPersistedFieldSafe("ctx-not-opaque", "ctx", "OPAQUE_CONTEXT_ID"),
+      ).toThrow(/rule=CONTEXT_ID_NOT_OPAQUE/);
+      expect(() =>
+        assertPersistedFieldSafe(VALID_CTX_HASH_A, "ctx", "OPAQUE_CONTEXT_ID"),
+      ).not.toThrow();
+    });
+
+    it("keeps HMAC and provenance constraints intact for the 73-product path", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+      const listings = fictionalBatch(73);
+      const missingHmac = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(listings, {
+          scanRunId: "scan-no-hmac",
+          fulfillmentContextHash: "not-an-opaque-id",
+          pricingVerificationVerdict: "UNVERIFIED_MISSING_HMAC_SECRET",
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(missingHmac.persisted).toBe(false);
+      expect(missingHmac.reason).toBe("INELIGIBLE_BATCH");
+
+      const ok = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(listings, { scanRunId: "scan-hmac-ok" }),
+        { ownerConfirmed: true },
+      );
+      expect(ok.persisted).toBe(true);
+      const history = repo.getProductPriceHistory("fx-1000");
+      expect(history[0]?.provenance).toBe("PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL");
+      repo.close();
     });
   });
 });
