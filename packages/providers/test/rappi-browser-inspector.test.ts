@@ -6,6 +6,7 @@ import { buildCanonicalListingKey, createCopAmount } from "@priceradar/domain";
 import type { RawStorefrontSnapshot } from "../src/index.ts";
 import {
   classifyObservationProvenance,
+  buildSourceViewDescriptor,
   computeKeyedContextIdentifiersWithRotation,
   computePrivacyPreservingContextHash,
   consolidateDomProductCardCandidates,
@@ -808,5 +809,80 @@ describe("Phase P1 — Supervised Rappi Browser Inspector (Step 6 + F-P1-01 + F-
     expect(report.listings.some((l) => l.variant.externalProductId === "900555")).toBe(
       false,
     );
+  });
+
+  describe("Phase P3 — Supervised Catalog Coverage & Source View Descriptors", () => {
+    it("builds a canonical STORE_ROOT descriptor for store root URLs", () => {
+      const descriptor = buildSourceViewDescriptor({
+        pageUrl: "https://www.rappi.com.co/tiendas/900130995-turbo-super",
+        nextDataRoute: "/tiendas/[store_type]/[store_id]",
+        domCardsBeforeCap: 75,
+        domCardCap: 120,
+      });
+
+      expect(descriptor).toBeDefined();
+      expect(descriptor?.pageKind).toBe("STORE_ROOT");
+      expect(descriptor?.viewKey).toBe("/tiendas/900130995-turbo-super");
+      expect(descriptor?.domCardsBeforeCap).toBe(75);
+      expect(descriptor?.domCardCapReached).toBe(false);
+      expect(descriptor?.labelSource).toBe("NONE");
+    });
+
+    it("builds a canonical STORE_SUBPATH descriptor for category pages and sanitizes query params", () => {
+      const descriptor = buildSourceViewDescriptor({
+        pageUrl:
+          "https://www.rappi.com.co/tiendas/900130995-turbo-super/lacteos-y-huevos?category_id=456&token=SECRET_JWT_VALUE&lat=6.208&lng=-75.567",
+        nextDataRoute: "/tiendas/[store_type]/[store_id]/[category]",
+        domCardsBeforeCap: 140,
+        domCardCap: 120,
+        ownerLabel: "Lácteos y Huevos",
+      });
+
+      expect(descriptor).toBeDefined();
+      expect(descriptor?.pageKind).toBe("STORE_SUBPATH");
+      expect(descriptor?.viewKey).toBe(
+        "/tiendas/900130995-turbo-super/lacteos-y-huevos?category_id=456",
+      );
+      // Sensitive query params (token, lat, lng) must be stripped!
+      expect(descriptor?.viewKey).not.toContain("token");
+      expect(descriptor?.viewKey).not.toContain("lat");
+      expect(descriptor?.viewKey).not.toContain("lng");
+      expect(descriptor?.domCardsBeforeCap).toBe(140);
+      expect(descriptor?.domCardCapReached).toBe(true);
+      expect(descriptor?.ownerLabel).toBe("Lácteos y Huevos");
+      expect(descriptor?.labelSource).toBe("OWNER_PROVIDED");
+    });
+
+    it("returns undefined for external or malformed URLs", () => {
+      expect(
+        buildSourceViewDescriptor({
+          pageUrl: "https://evil.com/phishing/turbo",
+        }),
+      ).toBeUndefined();
+      expect(
+        buildSourceViewDescriptor({
+          pageUrl: "not-a-valid-url",
+        }),
+      ).toBeUndefined();
+    });
+
+    it("preserves sourceView in StorefrontInspectionReport", () => {
+      const sourceView = buildSourceViewDescriptor({
+        pageUrl: "https://www.rappi.com.co/tiendas/900130995-turbo-super/despensa",
+        domCardsBeforeCap: 80,
+      });
+
+      expect(sourceView).toBeDefined();
+      const report = inspectStorefrontSnapshot({
+        ...BASE_SNAPSHOT,
+        pageUrl: "https://www.rappi.com.co/tiendas/900130995-turbo-super/despensa",
+        ...(sourceView ? { sourceView } : {}),
+        rawCards: [BASE_CARD],
+      });
+
+      expect(report.sourceView).toBeDefined();
+      expect(report.sourceView?.pageKind).toBe("STORE_SUBPATH");
+      expect(report.sourceView?.viewKey).toBe("/tiendas/900130995-turbo-super/despensa");
+    });
   });
 });

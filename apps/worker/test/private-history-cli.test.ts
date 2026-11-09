@@ -269,4 +269,116 @@ describe("Private History CLI & Consent Workflow — Phase P2 (Section 13.4)", (
     const statusPayload = statusAfterCrash.payload.status as PrivateDatabaseStatusSummary;
     expect(statusPayload.counts.activeObservations).toBe(0);
   });
+
+  describe("Phase P3 — Supervised Catalog Coverage CLI & Reporting", () => {
+    it("formats redacted consent summary including source view and product discovery counts", async () => {
+      const snapshot = {
+        ...makeSupervisedProvisionalSnapshot(),
+        sourceView: {
+          viewKey: "/tiendas/900130995-turbo-super/lacteos",
+          pageKind: "STORE_SUBPATH" as const,
+          ownerLabel: "Lácteos y Quesos",
+          domCardsBeforeCap: 45,
+          domCardCapReached: false,
+          labelSource: "OWNER_PROVIDED" as const,
+        },
+      };
+
+      const previewOut = await executePrivateHistoryCliCommand({
+        command: "preview",
+        dbPath,
+        snapshot,
+      });
+
+      expect(previewOut.exitCode).toBe(0);
+      expect(previewOut.messageEsCo).toContain("Vista de catálogo");
+      expect(previewOut.messageEsCo).toContain("Lácteos y Quesos");
+      expect(previewOut.messageEsCo).toContain("Productos en catálogo");
+      expect(previewOut.messageEsCo).toContain("Nuevos descubiertos=1");
+    });
+
+    it("executes the coverage CLI command returning aggregated metrics and views", async () => {
+      // 1. Initial empty coverage report
+      const initialCoverage = await executePrivateHistoryCliCommand({
+        command: "coverage",
+        dbPath,
+      });
+      expect(initialCoverage.exitCode).toBe(0);
+      expect(initialCoverage.titleEsCo).toContain("cobertura");
+      const emptyPayload = initialCoverage.payload.coverage as {
+        totalDistinctProducts: number;
+        totalScanRuns: number;
+      };
+      expect(emptyPayload.totalDistinctProducts).toBe(0);
+      expect(emptyPayload.totalScanRuns).toBe(0);
+
+      // 2. Save View 1 (Root)
+      const save1 = await executePrivateHistoryCliCommand({
+        command: "save",
+        dbPath,
+        snapshot: {
+          ...makeSupervisedProvisionalSnapshot(),
+          sourceView: {
+            viewKey: "/tiendas/900130995-turbo-super",
+            pageKind: "STORE_ROOT" as const,
+            domCardsBeforeCap: 1,
+            domCardCapReached: false,
+            labelSource: "NONE" as const,
+          },
+        },
+        confirmPersistence: async () => true,
+      });
+      expect(save1.exitCode).toBe(0);
+
+      // 3. Save View 2 (Category subpath) with new product
+      const save2 = await executePrivateHistoryCliCommand({
+        command: "save",
+        dbPath,
+        snapshot: {
+          ...makeSupervisedProvisionalSnapshot({
+            observedAtIso: "2026-11-05T14:10:00.000Z",
+          }),
+          sourceView: {
+            viewKey: "/tiendas/900130995-turbo-super/despensa",
+            pageKind: "STORE_SUBPATH" as const,
+            ownerLabel: "Despensa",
+            domCardsBeforeCap: 1,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED" as const,
+          },
+          rawCards: [
+            {
+              externalId: "3004567",
+              name: "Café Juan Valdez 500 g",
+              packagingText: "500 g",
+              priceText: "$ 32.000",
+              availabilityText: "Agregar",
+              inStockFlag: true,
+              href: "https://www.rappi.com.co/p/cafe-juan-valdez-3004567",
+            },
+          ],
+        },
+        confirmPersistence: async () => true,
+      });
+      expect(save2.exitCode).toBe(0);
+
+      // 4. Query coverage report after both views
+      const coverageOut = await executePrivateHistoryCliCommand({
+        command: "coverage",
+        dbPath,
+        staleDays: 14,
+      });
+      expect(coverageOut.exitCode).toBe(0);
+      const coverage = coverageOut.payload.coverage as {
+        totalDistinctProducts: number;
+        totalScanRuns: number;
+        totalInspectedViews: number;
+        views: Array<{ viewKey: string; ownerLabel?: string }>;
+      };
+      expect(coverage.totalDistinctProducts).toBe(2);
+      expect(coverage.totalScanRuns).toBe(2);
+      expect(coverage.totalInspectedViews).toBe(2);
+      expect(coverage.views).toHaveLength(2);
+    });
+  });
 });

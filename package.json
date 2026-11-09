@@ -21,6 +21,7 @@
     "history:product": "pnpm --filter @priceradar/worker history:cli product",
     "history:drops": "pnpm --filter @priceradar/worker history:cli drops",
     "history:anomalies": "pnpm --filter @priceradar/worker history:cli anomalies",
+    "history:coverage": "pnpm --filter @priceradar/worker history:cli coverage",
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "format:write": "prettier --write .",

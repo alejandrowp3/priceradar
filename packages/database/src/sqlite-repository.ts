@@ -14,6 +14,7 @@ import type {
   OpportunityType,
   PriceIntelligenceConfig,
   PriceObservationRecord,
+  SourceViewDescriptor,
 } from "@priceradar/domain";
 import {
   buildCanonicalListingKey,
@@ -274,6 +275,7 @@ export interface SupervisedPersistenceContextInput {
   readonly skippedMalformedCount: number;
   readonly duplicateSuppressedCount: number;
   readonly listings: readonly DiscoveredListing[];
+  readonly sourceView?: SourceViewDescriptor;
 }
 
 export interface BatchPreviewItem {
@@ -298,11 +300,14 @@ export interface BatchPreviewSummary {
   readonly duplicateSuppressedCount: number;
   readonly newObservationsCount: number;
   readonly alreadyPersistedDuplicateCount: number;
+  readonly newProductsCount: number;
+  readonly previouslyKnownProductsCount: number;
   readonly priceDecreasesCount: number;
   readonly priceIncreasesCount: number;
   readonly unchangedPricesCount: number;
   readonly firstObservationsCount: number;
   readonly candidateOpportunitiesCount: number;
+  readonly sourceView?: SourceViewDescriptor;
   readonly items: readonly BatchPreviewItem[];
 }
 
@@ -329,6 +334,9 @@ export interface PersistApprovedBatchResult {
   readonly observationsInserted: number;
   readonly observationsSkippedDuplicate: number;
   readonly opportunitiesInserted: number;
+  readonly newProductsDiscovered?: number;
+  readonly existingProductsObserved?: number;
+  readonly sourceView?: SourceViewDescriptor;
   readonly errorSummary?: string;
 }
 
@@ -354,8 +362,61 @@ export interface PersistedScanRunRow {
   readonly skippedRecords: number;
   readonly duplicateRecords: number;
   readonly opportunitiesCreated: number;
+  readonly sourceViewKey?: string;
+  readonly sourceViewKind?: string;
+  readonly sourceViewLabel?: string;
+  readonly newProductsDiscovered?: number;
+  readonly existingProductsObserved?: number;
   readonly errorCategory?: string;
   readonly errorSummary?: string;
+}
+
+export interface CatalogCoverageViewSummary {
+  readonly viewKey: string;
+  readonly pageKind: string;
+  readonly ownerLabel?: string;
+  readonly lastObservedAt: string;
+  readonly scanRunsCount: number;
+  readonly distinctProductsCount: number;
+  readonly totalObservationsCount: number;
+}
+
+export interface CatalogCoverageCategorySummary {
+  readonly categorySlug: string;
+  readonly distinctProductsCount: number;
+  readonly distinctVariantsCount: number;
+  readonly activeObservationsCount: number;
+  readonly lastSeenAt: string;
+}
+
+export interface CatalogCoverageReport {
+  readonly totalDistinctProducts: number;
+  readonly totalDistinctVariants: number;
+  readonly totalActiveObservations: number;
+  readonly totalScanRuns: number;
+  readonly totalInspectedViews: number;
+  readonly latestScanRun?: {
+    readonly scanRunId: string;
+    readonly observedAt: string;
+    readonly viewKey?: string;
+    readonly viewKind?: string;
+    readonly viewLabel?: string;
+    readonly validObservations: number;
+    readonly duplicateRecordsSuppressed: number;
+    readonly newProductsDiscovered: number;
+    readonly existingProductsObserved: number;
+  };
+  readonly views: readonly CatalogCoverageViewSummary[];
+  readonly categories: readonly CatalogCoverageCategorySummary[];
+  readonly staleProductsCount: number;
+  readonly staleThresholdDays: number;
+  readonly newestProductsSample: readonly {
+    readonly productId: string;
+    readonly productName: string;
+    readonly categorySlug: string;
+    readonly firstSeenAt: string;
+    readonly lastSeenAt: string;
+  }[];
 }
 
 export interface PersistedProductObservationHistoryRow {
@@ -992,6 +1053,25 @@ export class SqlitePrivateHistoryRepository {
     if (!columnsOf("scan_runs").has("batch_fingerprint")) {
       this.db.exec("ALTER TABLE scan_runs ADD COLUMN batch_fingerprint TEXT;");
     }
+    if (!columnsOf("scan_runs").has("source_view_key")) {
+      this.db.exec("ALTER TABLE scan_runs ADD COLUMN source_view_key TEXT;");
+    }
+    if (!columnsOf("scan_runs").has("source_view_kind")) {
+      this.db.exec("ALTER TABLE scan_runs ADD COLUMN source_view_kind TEXT;");
+    }
+    if (!columnsOf("scan_runs").has("source_view_label")) {
+      this.db.exec("ALTER TABLE scan_runs ADD COLUMN source_view_label TEXT;");
+    }
+    if (!columnsOf("scan_runs").has("new_products_discovered")) {
+      this.db.exec(
+        "ALTER TABLE scan_runs ADD COLUMN new_products_discovered INTEGER NOT NULL DEFAULT 0 CHECK (new_products_discovered >= 0);",
+      );
+    }
+    if (!columnsOf("scan_runs").has("existing_products_observed")) {
+      this.db.exec(
+        "ALTER TABLE scan_runs ADD COLUMN existing_products_observed INTEGER NOT NULL DEFAULT 0 CHECK (existing_products_observed >= 0);",
+      );
+    }
 
     const oppColumns = columnsOf("opportunity_events");
     if (!oppColumns.has("event_origin")) {
@@ -1025,6 +1105,15 @@ export class SqlitePrivateHistoryRepository {
 
       CREATE INDEX IF NOT EXISTS idx_opportunity_lifecycle_transitions_opportunity
         ON opportunity_lifecycle_transitions(opportunity_id, transition_id);
+
+      CREATE TABLE IF NOT EXISTS scan_run_products (
+        scan_run_id TEXT NOT NULL REFERENCES scan_runs(scan_run_id) ON DELETE CASCADE,
+        product_variant_key TEXT NOT NULL REFERENCES products(product_variant_key),
+        PRIMARY KEY (scan_run_id, product_variant_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_scan_run_products_product
+        ON scan_run_products(product_variant_key);
     `);
   }
 
@@ -1228,11 +1317,14 @@ export class SqlitePrivateHistoryRepository {
         duplicateSuppressedCount: context.duplicateSuppressedCount,
         newObservationsCount: 0,
         alreadyPersistedDuplicateCount: 0,
+        newProductsCount: 0,
+        previouslyKnownProductsCount: 0,
         priceDecreasesCount: 0,
         priceIncreasesCount: 0,
         unchangedPricesCount: 0,
         firstObservationsCount: 0,
         candidateOpportunitiesCount: 0,
+        ...(context.sourceView !== undefined ? { sourceView: context.sourceView } : {}),
         items: [],
       };
     }
@@ -1243,6 +1335,8 @@ export class SqlitePrivateHistoryRepository {
 
     let newObservationsCount = 0;
     let alreadyPersistedDuplicateCount = 0;
+    let newProductsCount = 0;
+    let previouslyKnownProductsCount = 0;
     let priceDecreasesCount = 0;
     let priceIncreasesCount = 0;
     let unchangedPricesCount = 0;
@@ -1253,6 +1347,10 @@ export class SqlitePrivateHistoryRepository {
     const checkIdempotencyStmt = this.db.prepare(
       "SELECT 1 FROM price_observations WHERE idempotency_key = ? LIMIT 1",
     );
+    const checkProductExistsStmt = this.db.prepare(
+      "SELECT 1 FROM products WHERE product_variant_key = ? LIMIT 1",
+    );
+    const seenProductKeysInBatch = new Set<string>();
 
     for (const rawListing of context.listings) {
       const normalizedListing: DiscoveredListing = {
@@ -1263,6 +1361,16 @@ export class SqlitePrivateHistoryRepository {
           zoneCode: contextHash,
         },
       };
+
+      const productKey = `${normalizedListing.providerId}::${normalizedListing.variant.externalProductId}::${normalizedListing.variant.externalVariantId}`;
+      if (!seenProductKeysInBatch.has(productKey)) {
+        seenProductKeysInBatch.add(productKey);
+        if (checkProductExistsStmt.get(productKey)) {
+          previouslyKnownProductsCount += 1;
+        } else {
+          newProductsCount += 1;
+        }
+      }
 
       const listingKey = buildCanonicalListingKey({
         providerId: normalizedListing.providerId,
@@ -1349,11 +1457,14 @@ export class SqlitePrivateHistoryRepository {
       duplicateSuppressedCount: context.duplicateSuppressedCount,
       newObservationsCount,
       alreadyPersistedDuplicateCount,
+      newProductsCount,
+      previouslyKnownProductsCount,
       priceDecreasesCount,
       priceIncreasesCount,
       unchangedPricesCount,
       firstObservationsCount,
       candidateOpportunitiesCount,
+      ...(context.sourceView !== undefined ? { sourceView: context.sourceView } : {}),
       items,
     };
   }
@@ -1410,10 +1521,26 @@ export class SqlitePrivateHistoryRepository {
     assertPersistedFieldSafe(contextHash, "fulfillmentContextHash", "OPAQUE_CONTEXT_ID");
     assertPersistedFieldSafe(context.citySlug, "citySlug", "SLUG");
     assertPersistedFieldSafe(context.cityName, "cityName", "FREE_TEXT");
+    if (context.sourceView?.viewKey) {
+      assertPersistedFieldSafe(
+        context.sourceView.viewKey,
+        "sourceViewKey",
+        "PRODUCT_URL",
+      );
+    }
+    if (context.sourceView?.ownerLabel) {
+      assertPersistedFieldSafe(
+        context.sourceView.ownerLabel,
+        "sourceViewLabel",
+        "PRODUCT_LABEL",
+      );
+    }
 
     let observationsInserted = 0;
     let observationsSkippedDuplicate = 0;
     let opportunitiesInserted = 0;
+    let newProductsDiscovered = 0;
+    let existingProductsObserved = 0;
     let earlyScanRunResult: PersistApprovedBatchResult | undefined;
 
     try {
@@ -1422,6 +1549,11 @@ export class SqlitePrivateHistoryRepository {
         if (!firstListing) {
           throw new Error("Empty listings in eligible batch.");
         }
+
+        const checkProductExistsStmt = this.db.prepare(
+          "SELECT 1 FROM products WHERE product_variant_key = ? LIMIT 1",
+        );
+        const seenProductKeysInBatch = new Set<string>();
 
         // F-P2-07: Check if scan_run_id already exists before any mutation
         const existingScanRun = this.db
@@ -1482,6 +1614,11 @@ export class SqlitePrivateHistoryRepository {
               observationsInserted: 0,
               observationsSkippedDuplicate: context.listings.length,
               opportunitiesInserted: 0,
+              newProductsDiscovered: 0,
+              existingProductsObserved: Number(existingScanRun.valid_observations),
+              ...(context.sourceView !== undefined
+                ? { sourceView: context.sourceView }
+                : {}),
             };
             return;
           }
@@ -1598,6 +1735,9 @@ export class SqlitePrivateHistoryRepository {
             `INSERT INTO scan_runs (
               scan_run_id,
               batch_fingerprint,
+              source_view_key,
+              source_view_kind,
+              source_view_label,
               started_at,
               completed_at,
               status,
@@ -1608,12 +1748,17 @@ export class SqlitePrivateHistoryRepository {
               valid_observations,
               skipped_records,
               duplicate_records,
-              opportunities_created
-            ) VALUES (?, ?, ?, NULL, 'RUNNING', ?, ?, ?, ?, 0, ?, ?, 0)`,
+              opportunities_created,
+              new_products_discovered,
+              existing_products_observed
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'RUNNING', ?, ?, ?, ?, 0, ?, ?, 0, 0, 0)`,
           )
           .run(
             context.scanRunId,
             batchFingerprint,
+            context.sourceView?.viewKey ?? null,
+            context.sourceView?.pageKind ?? null,
+            context.sourceView?.ownerLabel ?? null,
             context.observedAtIso,
             providerId,
             storeKey,
@@ -1645,6 +1790,14 @@ export class SqlitePrivateHistoryRepository {
             packaging_label = excluded.packaging_label,
             canonical_product_url = excluded.canonical_product_url,
             last_seen_at = excluded.last_seen_at`,
+        );
+
+        const insertScanRunProductStmt = this.db.prepare(
+          `INSERT INTO scan_run_products (
+            scan_run_id,
+            product_variant_key
+          ) VALUES (?, ?)
+          ON CONFLICT(scan_run_id, product_variant_key) DO NOTHING`,
         );
 
         const insertObservationStmt = this.db.prepare(
@@ -1766,6 +1919,14 @@ export class SqlitePrivateHistoryRepository {
           );
 
           const productVariantKey = `${rawListing.providerId}::${rawListing.variant.externalProductId}::${rawListing.variant.externalVariantId}`;
+          if (!seenProductKeysInBatch.has(productVariantKey)) {
+            seenProductKeysInBatch.add(productVariantKey);
+            if (checkProductExistsStmt.get(productVariantKey)) {
+              existingProductsObserved += 1;
+            } else {
+              newProductsDiscovered += 1;
+            }
+          }
           const normalizedBrand =
             rawListing.variant.brand &&
             rawListing.variant.brand !== "Sin marca especificada"
@@ -1787,6 +1948,8 @@ export class SqlitePrivateHistoryRepository {
             rawListing.sourceObservedAt,
             rawListing.sourceObservedAt,
           );
+
+          insertScanRunProductStmt.run(context.scanRunId, productVariantKey);
 
           const listingKey = buildCanonicalListingKey({
             providerId: rawListing.providerId,
@@ -1954,7 +2117,9 @@ export class SqlitePrivateHistoryRepository {
                  status = 'SUCCEEDED',
                  valid_observations = ?,
                  duplicate_records = duplicate_records + ?,
-                 opportunities_created = ?
+                 opportunities_created = ?,
+                 new_products_discovered = ?,
+                 existing_products_observed = ?
              WHERE scan_run_id = ?`,
           )
           .run(
@@ -1962,6 +2127,8 @@ export class SqlitePrivateHistoryRepository {
             actualObsCount,
             observationsSkippedDuplicate,
             actualOppCount,
+            newProductsDiscovered,
+            existingProductsObserved,
             context.scanRunId,
           );
       });
@@ -1977,6 +2144,9 @@ export class SqlitePrivateHistoryRepository {
         observationsInserted,
         observationsSkippedDuplicate,
         opportunitiesInserted,
+        newProductsDiscovered,
+        existingProductsObserved,
+        ...(context.sourceView !== undefined ? { sourceView: context.sourceView } : {}),
       };
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2526,6 +2696,11 @@ export class SqlitePrivateHistoryRepository {
           skipped_records,
           duplicate_records,
           opportunities_created,
+          source_view_key,
+          source_view_kind,
+          source_view_label,
+          new_products_discovered,
+          existing_products_observed,
           error_category,
           error_summary
         FROM scan_runs
@@ -2545,6 +2720,11 @@ export class SqlitePrivateHistoryRepository {
       skipped_records: number;
       duplicate_records: number;
       opportunities_created: number;
+      source_view_key: string | null;
+      source_view_kind: string | null;
+      source_view_label: string | null;
+      new_products_discovered: number | null;
+      existing_products_observed: number | null;
       error_category: string | null;
       error_summary: string | null;
     }>;
@@ -2564,9 +2744,218 @@ export class SqlitePrivateHistoryRepository {
       skippedRecords: r.skipped_records,
       duplicateRecords: r.duplicate_records,
       opportunitiesCreated: r.opportunities_created,
+      ...(r.source_view_key !== null ? { sourceViewKey: r.source_view_key } : {}),
+      ...(r.source_view_kind !== null ? { sourceViewKind: r.source_view_kind } : {}),
+      ...(r.source_view_label !== null ? { sourceViewLabel: r.source_view_label } : {}),
+      newProductsDiscovered: r.new_products_discovered ?? 0,
+      existingProductsObserved: r.existing_products_observed ?? 0,
       ...(r.error_category !== null ? { errorCategory: r.error_category } : {}),
       ...(r.error_summary !== null ? { errorSummary: r.error_summary } : {}),
     }));
+  }
+
+  /**
+   * Generates a comprehensive, privacy-preserving catalog coverage report (`P3`).
+   * Measures accumulated unique products, variants, active observations, views inspected,
+   * category distribution and freshness without claiming to know Turbo's complete catalog denominator.
+   */
+  public getCatalogCoverageReport(options?: {
+    readonly staleDays?: number;
+  }): CatalogCoverageReport {
+    const staleDays = Math.max(1, options?.staleDays ?? 7);
+
+    const totalDistinctProductsRow = this.db
+      .prepare("SELECT COUNT(DISTINCT external_product_id) as c FROM products")
+      .get() as { c: number } | undefined;
+    const totalDistinctVariantsRow = this.db
+      .prepare("SELECT COUNT(*) as c FROM products")
+      .get() as { c: number } | undefined;
+    const totalActiveObsRow = this.db
+      .prepare("SELECT COUNT(*) as c FROM price_observations WHERE is_superseded = 0")
+      .get() as { c: number } | undefined;
+    const totalScanRunsRow = this.db
+      .prepare("SELECT COUNT(*) as c FROM scan_runs WHERE status = 'SUCCEEDED'")
+      .get() as { c: number } | undefined;
+    const totalInspectedViewsRow = this.db
+      .prepare(
+        "SELECT COUNT(DISTINCT COALESCE(source_view_key, 'VISTA_DEFAULT')) as c FROM scan_runs WHERE status = 'SUCCEEDED'",
+      )
+      .get() as { c: number } | undefined;
+
+    const latestScanRunRow = this.db
+      .prepare(
+        `SELECT
+          scan_run_id,
+          started_at,
+          source_view_key,
+          source_view_kind,
+          source_view_label,
+          valid_observations,
+          duplicate_records,
+          new_products_discovered,
+          existing_products_observed
+        FROM scan_runs
+        WHERE status = 'SUCCEEDED'
+        ORDER BY started_at DESC
+        LIMIT 1`,
+      )
+      .get() as
+      | {
+          scan_run_id: string;
+          started_at: string;
+          source_view_key: string | null;
+          source_view_kind: string | null;
+          source_view_label: string | null;
+          valid_observations: number;
+          duplicate_records: number;
+          new_products_discovered: number;
+          existing_products_observed: number;
+        }
+      | undefined;
+
+    const viewRows = this.db
+      .prepare(
+        `SELECT
+          COALESCE(r.source_view_key, 'VISTA_DEFAULT') as view_key,
+          COALESCE(r.source_view_kind, 'STORE_ROOT') as page_kind,
+          r.source_view_label as owner_label,
+          MAX(r.started_at) as last_observed_at,
+          COUNT(DISTINCT r.scan_run_id) as scan_runs_count,
+          (
+            SELECT COUNT(DISTINCT product_key)
+            FROM (
+              SELECT srp.product_variant_key as product_key
+              FROM scan_run_products srp
+              JOIN scan_runs r2 ON r2.scan_run_id = srp.scan_run_id
+              WHERE r2.status = 'SUCCEEDED'
+                AND COALESCE(r2.source_view_key, 'VISTA_DEFAULT') = COALESCE(r.source_view_key, 'VISTA_DEFAULT')
+              UNION
+              SELECT o2.product_variant_key as product_key
+              FROM price_observations o2
+              JOIN scan_runs r2 ON r2.scan_run_id = o2.scan_run_id
+              WHERE r2.status = 'SUCCEEDED'
+                AND o2.is_superseded = 0
+                AND COALESCE(r2.source_view_key, 'VISTA_DEFAULT') = COALESCE(r.source_view_key, 'VISTA_DEFAULT')
+            )
+          ) as distinct_products_count,
+          COUNT(o.observation_id) as total_observations_count
+        FROM scan_runs r
+        LEFT JOIN price_observations o ON o.scan_run_id = r.scan_run_id AND o.is_superseded = 0
+        WHERE r.status = 'SUCCEEDED'
+        GROUP BY COALESCE(r.source_view_key, 'VISTA_DEFAULT')
+        ORDER BY last_observed_at DESC`,
+      )
+      .all() as Array<{
+      view_key: string;
+      page_kind: string;
+      owner_label: string | null;
+      last_observed_at: string;
+      scan_runs_count: number;
+      distinct_products_count: number;
+      total_observations_count: number;
+    }>;
+
+    const categoryRows = this.db
+      .prepare(
+        `SELECT
+          p.category_slug,
+          COUNT(DISTINCT p.external_product_id) as distinct_products_count,
+          COUNT(DISTINCT p.product_variant_key) as distinct_variants_count,
+          COUNT(o.observation_id) as active_observations_count,
+          MAX(p.last_seen_at) as last_seen_at
+        FROM products p
+        LEFT JOIN price_observations o ON o.product_variant_key = p.product_variant_key AND o.is_superseded = 0
+        GROUP BY p.category_slug
+        ORDER BY distinct_products_count DESC, p.category_slug ASC`,
+      )
+      .all() as Array<{
+      category_slug: string;
+      distinct_products_count: number;
+      distinct_variants_count: number;
+      active_observations_count: number;
+      last_seen_at: string;
+    }>;
+
+    const staleCutoff = new Date(
+      Date.now() - staleDays * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const staleCountRow = this.db
+      .prepare("SELECT COUNT(*) as c FROM products WHERE last_seen_at < ?")
+      .get(staleCutoff) as { c: number } | undefined;
+
+    const newestProductsRows = this.db
+      .prepare(
+        `SELECT
+          external_product_id,
+          product_name,
+          category_slug,
+          first_seen_at,
+          last_seen_at
+        FROM products
+        ORDER BY first_seen_at DESC, product_variant_key ASC
+        LIMIT 5`,
+      )
+      .all() as Array<{
+      external_product_id: string;
+      product_name: string;
+      category_slug: string;
+      first_seen_at: string;
+      last_seen_at: string;
+    }>;
+
+    return {
+      totalDistinctProducts: Number(totalDistinctProductsRow?.c ?? 0),
+      totalDistinctVariants: Number(totalDistinctVariantsRow?.c ?? 0),
+      totalActiveObservations: Number(totalActiveObsRow?.c ?? 0),
+      totalScanRuns: Number(totalScanRunsRow?.c ?? 0),
+      totalInspectedViews: Number(totalInspectedViewsRow?.c ?? 0),
+      ...(latestScanRunRow !== undefined
+        ? {
+            latestScanRun: {
+              scanRunId: latestScanRunRow.scan_run_id,
+              observedAt: latestScanRunRow.started_at,
+              ...(latestScanRunRow.source_view_key !== null
+                ? { viewKey: latestScanRunRow.source_view_key }
+                : {}),
+              ...(latestScanRunRow.source_view_kind !== null
+                ? { viewKind: latestScanRunRow.source_view_kind }
+                : {}),
+              ...(latestScanRunRow.source_view_label !== null
+                ? { viewLabel: latestScanRunRow.source_view_label }
+                : {}),
+              validObservations: latestScanRunRow.valid_observations,
+              duplicateRecordsSuppressed: latestScanRunRow.duplicate_records,
+              newProductsDiscovered: latestScanRunRow.new_products_discovered,
+              existingProductsObserved: latestScanRunRow.existing_products_observed,
+            },
+          }
+        : {}),
+      views: viewRows.map((v) => ({
+        viewKey: v.view_key,
+        pageKind: v.page_kind,
+        ...(v.owner_label !== null ? { ownerLabel: v.owner_label } : {}),
+        lastObservedAt: v.last_observed_at,
+        scanRunsCount: v.scan_runs_count,
+        distinctProductsCount: v.distinct_products_count,
+        totalObservationsCount: v.total_observations_count,
+      })),
+      categories: categoryRows.map((c) => ({
+        categorySlug: c.category_slug,
+        distinctProductsCount: c.distinct_products_count,
+        distinctVariantsCount: c.distinct_variants_count,
+        activeObservationsCount: c.active_observations_count,
+        lastSeenAt: c.last_seen_at,
+      })),
+      staleProductsCount: Number(staleCountRow?.c ?? 0),
+      staleThresholdDays: staleDays,
+      newestProductsSample: newestProductsRows.map((p) => ({
+        productId: p.external_product_id,
+        productName: p.product_name,
+        categorySlug: p.category_slug,
+        firstSeenAt: p.first_seen_at,
+        lastSeenAt: p.last_seen_at,
+      })),
+    };
   }
 
   public getProductPriceHistory(
