@@ -2,6 +2,7 @@ import readline from "node:readline/promises";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { Browser, BrowserContext, Page } from "@playwright/test";
 import { chromium } from "@playwright/test";
 import {
@@ -22,7 +23,10 @@ import {
   SupervisedBrowserSnapshotProvider,
   buildSourceViewDescriptor,
 } from "@priceradar/providers";
-import { executePrivateHistoryCliCommand } from "./private-history-cli.ts";
+import {
+  executePrivateHistoryCliCommand,
+  promptOwnerConsentInTerminal,
+} from "./private-history-cli.ts";
 import { executeDiscoveryScan } from "./scanner.ts";
 
 const WORKSPACE_ENV_LOCAL_PATH = path.resolve(import.meta.dirname, "../../../.env.local");
@@ -792,6 +796,212 @@ async function launchIsolatedContext(persistAuthorizedPersonalProfile: boolean):
   }
 }
 
+export interface InteractiveCatalogSessionStats {
+  viewsInspected: number;
+  observationsInserted: number;
+  opportunitiesInserted: number;
+  newProductsDiscovered: number;
+}
+
+export interface InteractiveCatalogSessionOptions {
+  readonly rl?: readline.Interface;
+  readonly inputStream?: NodeJS.ReadableStream;
+  readonly outputStream?: NodeJS.WritableStream;
+  readonly dbPath?: string;
+  readonly label?: string;
+  readonly nonInteractiveInspect?: boolean;
+  readonly saveToPrivateHistory?: boolean;
+  readonly previewPrivateHistory?: boolean;
+  readonly allowProvisionalSessionObservations?: boolean;
+  readonly page?: Page;
+  readonly contextHmacSecret?: string;
+  readonly navigationHistory?: string[];
+  readonly recordSanitizedPath?: (url: string) => void;
+  readonly captureSnapshot?: (
+    iteration: number,
+    currentLabel?: string,
+  ) => Promise<{
+    readonly snapshot: RawStorefrontSnapshot;
+    readonly uiDiagnostics?: SanitizedUiEvidenceDiagnostics;
+  }>;
+}
+
+export async function runInteractiveCatalogSession(
+  options: InteractiveCatalogSessionOptions,
+): Promise<InteractiveCatalogSessionStats> {
+  const ownsRl = !options.rl;
+  const rl =
+    options.rl ??
+    readline.createInterface({
+      input: options.inputStream ?? process.stdin,
+      output: options.outputStream ?? process.stdout,
+    });
+
+  let currentLabel = options.label;
+  let iteration = 1;
+  const sessionStats: InteractiveCatalogSessionStats = {
+    viewsInspected: 0,
+    observationsInserted: 0,
+    opportunitiesInserted: 0,
+    newProductsDiscovered: 0,
+  };
+
+  try {
+    while (true) {
+      if (!options.nonInteractiveInspect) {
+        const promptMsg =
+          iteration === 1
+            ? "\n[Acción Requerida] Selecciona tu dirección de entrega y abre una vista de tienda/categoría en Chromium, luego presiona ENTER aquí para inspeccionar..."
+            : "\n[Siguiente vista] Navega en Chromium a otra categoría o vista de catálogo.\nPresiona ENTER para inspeccionar (o escribe una etiqueta opcional), o escribe 'salir' para terminar [ENTER / etiqueta / 'salir']: ";
+        const inputAnswer = (await rl.question(promptMsg)).trim();
+        if (
+          iteration > 1 &&
+          (inputAnswer.toLowerCase() === "salir" || inputAnswer.toLowerCase() === "exit")
+        ) {
+          console.log("\nFinalizando sesión interactiva supervisada de catálogo...");
+          break;
+        }
+        if (iteration > 1) {
+          currentLabel = inputAnswer.length > 0 ? inputAnswer : undefined;
+        }
+      }
+
+      const captured = options.captureSnapshot
+        ? await options.captureSnapshot(iteration, currentLabel)
+        : await (async () => {
+            if (!options.page || !options.contextHmacSecret) {
+              throw new Error(
+                "runInteractiveCatalogSession requires either captureSnapshot or page and contextHmacSecret.",
+              );
+            }
+            if (options.recordSanitizedPath) {
+              options.recordSanitizedPath(options.page.url());
+            }
+            return captureReadOnlyDomSnapshotFromPage(
+              options.page,
+              new Date().toISOString(),
+              options.contextHmacSecret,
+              {
+                ...(options.navigationHistory !== undefined
+                  ? { sanitizedNavigationPathHistory: options.navigationHistory }
+                  : {}),
+                ...(options.allowProvisionalSessionObservations !== undefined
+                  ? {
+                      allowProvisionalSessionObservations:
+                        options.allowProvisionalSessionObservations,
+                    }
+                  : {}),
+                ...(currentLabel !== undefined ? { ownerLabel: currentLabel } : {}),
+              },
+            );
+          })();
+
+      sessionStats.viewsInspected += 1;
+
+      if (options.previewPrivateHistory || options.saveToPrivateHistory) {
+        const privateCliResult = await executePrivateHistoryCliCommand({
+          command: options.saveToPrivateHistory ? "save" : "preview",
+          ...(options.dbPath !== undefined ? { dbPath: options.dbPath } : {}),
+          snapshot: captured.snapshot,
+          confirmPersistence: async (preview) =>
+            promptOwnerConsentInTerminal(
+              preview,
+              options.dbPath ?? DEFAULT_PRIVATE_SQLITE_DB_PATH,
+              rl,
+            ),
+        });
+
+        console.log(
+          JSON.stringify(
+            {
+              service: "priceradar-rappi-inspect",
+              iteration,
+              viewKey: captured.snapshot.sourceView?.viewKey,
+              ownerLabel: captured.snapshot.sourceView?.ownerLabel,
+              privateHistoryAction: {
+                command: privateCliResult.command,
+                titleEsCo: privateCliResult.titleEsCo,
+                messageEsCo: privateCliResult.messageEsCo,
+                ...privateCliResult.payload,
+              },
+            },
+            null,
+            2,
+          ),
+        );
+
+        const res = (privateCliResult.payload as Record<string, unknown>)?.result as
+          | {
+              observationsInserted?: number;
+              opportunitiesInserted?: number;
+              newProductsDiscovered?: number;
+            }
+          | undefined;
+
+        if (res) {
+          sessionStats.observationsInserted += res.observationsInserted ?? 0;
+          sessionStats.opportunitiesInserted += res.opportunitiesInserted ?? 0;
+          sessionStats.newProductsDiscovered += res.newProductsDiscovered ?? 0;
+        }
+
+        console.log(
+          `\n[Progreso de Sesión] Vistas inspeccionadas: ${String(sessionStats.viewsInspected)} | Nuevos productos descubiertos: ${String(sessionStats.newProductsDiscovered)} | Observaciones guardadas: ${String(sessionStats.observationsInserted)}`,
+        );
+      } else {
+        const provider = new SupervisedBrowserSnapshotProvider(captured.snapshot);
+        const r = provider.getInspectionReport();
+        console.log(
+          JSON.stringify(
+            {
+              service: "priceradar-rappi-inspect",
+              iteration,
+              gateStatus: r.gateStatus,
+              gateMessage: r.gateMessage,
+              pageUrl: r.pageUrl,
+              sourceView: captured.snapshot.sourceView,
+              candidateListings: r.listings.length,
+            },
+            null,
+            2,
+          ),
+        );
+      }
+
+      if (options.nonInteractiveInspect) {
+        break;
+      }
+
+      iteration += 1;
+    }
+  } finally {
+    if (ownsRl) {
+      rl.close();
+    }
+  }
+
+  console.log(
+    "================================================================================",
+  );
+  console.log("Resumen de Sesión de Cobertura Supervisada:");
+  console.log(
+    `- Vistas inspeccionadas          : ${String(sessionStats.viewsInspected)}`,
+  );
+  console.log(
+    `- Nuevos productos descubiertos  : ${String(sessionStats.newProductsDiscovered)}`,
+  );
+  console.log(
+    `- Observaciones guardadas        : ${String(sessionStats.observationsInserted)}`,
+  );
+  console.log(
+    `- Oportunidades guardadas        : ${String(sessionStats.opportunitiesInserted)}`,
+  );
+  console.log(
+    "================================================================================",
+  );
+
+  return sessionStats;
+}
+
 async function runSupervisedBrowserPoc(): Promise<void> {
   const options = parseCliArgs(process.argv.slice(2));
   const nowIso = "2026-11-07T13:20:00.000Z";
@@ -880,152 +1090,19 @@ async function runSupervisedBrowserPoc(): Promise<void> {
       recordSanitizedPath(page.url());
 
       if (options.interactiveLoop) {
-        const rl = readline.createInterface({
-          input: process.stdin,
-          output: process.stdout,
+        await runInteractiveCatalogSession({
+          ...(options.dbPath !== undefined ? { dbPath: options.dbPath } : {}),
+          ...(options.label !== undefined ? { label: options.label } : {}),
+          nonInteractiveInspect: options.nonInteractiveInspect,
+          saveToPrivateHistory: options.saveToPrivateHistory,
+          previewPrivateHistory: options.previewPrivateHistory,
+          allowProvisionalSessionObservations:
+            options.allowProvisionalSessionObservations,
+          page,
+          ...(contextHmacSecret !== undefined ? { contextHmacSecret } : {}),
+          navigationHistory,
+          recordSanitizedPath,
         });
-
-        let currentLabel = options.label;
-        let iteration = 1;
-        const sessionStats = {
-          viewsInspected: 0,
-          observationsInserted: 0,
-          opportunitiesInserted: 0,
-          newProductsDiscovered: 0,
-        };
-
-        try {
-          while (true) {
-            if (!options.nonInteractiveInspect) {
-              const promptMsg =
-                iteration === 1
-                  ? "\n[Acción Requerida] Selecciona tu dirección de entrega y abre una vista de tienda/categoría en Chromium, luego presiona ENTER aquí para inspeccionar..."
-                  : "\n[Siguiente vista] Navega en Chromium a otra categoría o vista de catálogo.\nPresiona ENTER para inspeccionar (o escribe una etiqueta opcional), o escribe 'salir' para terminar [ENTER / etiqueta / 'salir']: ";
-              const inputAnswer = (await rl.question(promptMsg)).trim();
-              if (
-                iteration > 1 &&
-                (inputAnswer.toLowerCase() === "salir" ||
-                  inputAnswer.toLowerCase() === "exit")
-              ) {
-                console.log(
-                  "\nFinalizando sesión interactiva supervisada de catálogo...",
-                );
-                break;
-              }
-              if (iteration > 1 && inputAnswer.length > 0) {
-                currentLabel = inputAnswer;
-              }
-            }
-
-            recordSanitizedPath(page.url());
-
-            const captured = await captureReadOnlyDomSnapshotFromPage(
-              page,
-              new Date().toISOString(),
-              contextHmacSecret,
-              {
-                sanitizedNavigationPathHistory: navigationHistory,
-                allowProvisionalSessionObservations:
-                  options.allowProvisionalSessionObservations,
-                ...(currentLabel !== undefined ? { ownerLabel: currentLabel } : {}),
-              },
-            );
-
-            sessionStats.viewsInspected += 1;
-
-            if (options.previewPrivateHistory || options.saveToPrivateHistory) {
-              const privateCliResult = await executePrivateHistoryCliCommand({
-                command: options.saveToPrivateHistory ? "save" : "preview",
-                dbPath: options.dbPath,
-                snapshot: captured.snapshot,
-              });
-
-              console.log(
-                JSON.stringify(
-                  {
-                    service: "priceradar-rappi-inspect",
-                    iteration,
-                    viewKey: captured.snapshot.sourceView?.viewKey,
-                    ownerLabel: captured.snapshot.sourceView?.ownerLabel,
-                    privateHistoryAction: {
-                      command: privateCliResult.command,
-                      titleEsCo: privateCliResult.titleEsCo,
-                      messageEsCo: privateCliResult.messageEsCo,
-                      ...privateCliResult.payload,
-                    },
-                  },
-                  null,
-                  2,
-                ),
-              );
-
-              const res = (privateCliResult.payload as Record<string, unknown>)
-                ?.result as
-                | {
-                    observationsInserted?: number;
-                    opportunitiesInserted?: number;
-                    newProductsDiscovered?: number;
-                  }
-                | undefined;
-
-              if (res) {
-                sessionStats.observationsInserted += res.observationsInserted ?? 0;
-                sessionStats.opportunitiesInserted += res.opportunitiesInserted ?? 0;
-                sessionStats.newProductsDiscovered += res.newProductsDiscovered ?? 0;
-              }
-
-              console.log(
-                `\n[Progreso de Sesión] Vistas inspeccionadas: ${String(sessionStats.viewsInspected)} | Nuevos productos descubiertos: ${String(sessionStats.newProductsDiscovered)} | Observaciones guardadas: ${String(sessionStats.observationsInserted)}`,
-              );
-            } else {
-              const provider = new SupervisedBrowserSnapshotProvider(captured.snapshot);
-              const r = provider.getInspectionReport();
-              console.log(
-                JSON.stringify(
-                  {
-                    service: "priceradar-rappi-inspect",
-                    iteration,
-                    gateStatus: r.gateStatus,
-                    gateMessage: r.gateMessage,
-                    pageUrl: r.pageUrl,
-                    sourceView: captured.snapshot.sourceView,
-                    candidateListings: r.listings.length,
-                  },
-                  null,
-                  2,
-                ),
-              );
-            }
-
-            if (options.nonInteractiveInspect) {
-              break;
-            }
-
-            iteration += 1;
-          }
-        } finally {
-          rl.close();
-        }
-
-        console.log(
-          "================================================================================",
-        );
-        console.log("Resumen de Sesión de Cobertura Supervisada:");
-        console.log(
-          `- Vistas inspeccionadas          : ${String(sessionStats.viewsInspected)}`,
-        );
-        console.log(
-          `- Nuevos productos descubiertos  : ${String(sessionStats.newProductsDiscovered)}`,
-        );
-        console.log(
-          `- Observaciones guardadas        : ${String(sessionStats.observationsInserted)}`,
-        );
-        console.log(
-          `- Oportunidades guardadas        : ${String(sessionStats.opportunitiesInserted)}`,
-        );
-        console.log(
-          "================================================================================",
-        );
         return;
       }
 
@@ -1192,13 +1269,20 @@ async function runSupervisedBrowserPoc(): Promise<void> {
   console.log(JSON.stringify(sanitizedSummary, null, 2));
 }
 
-runSupervisedBrowserPoc().catch((err) => {
-  console.error(
-    JSON.stringify({
-      service: "priceradar-rappi-inspect",
-      level: "ERROR",
-      message: err instanceof Error ? err.message : String(err),
-    }),
-  );
-  process.exit(1);
-});
+const isMainModule =
+  typeof process.argv[1] === "string" &&
+  (import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/")) ||
+    fileURLToPath(import.meta.url) === path.resolve(process.argv[1]));
+
+if (isMainModule) {
+  runSupervisedBrowserPoc().catch((err) => {
+    console.error(
+      JSON.stringify({
+        service: "priceradar-rappi-inspect",
+        level: "ERROR",
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    process.exit(1);
+  });
+}

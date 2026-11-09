@@ -145,15 +145,18 @@ export function formatRedactedConsentSummaryEsCo(
 export async function promptOwnerConsentInTerminal(
   preview: BatchPreviewSummary,
   dbPath: string,
+  existingRl?: readline.Interface,
 ): Promise<boolean> {
   console.log(formatRedactedConsentSummaryEsCo(preview, dbPath));
   if (!preview.isEligible) {
     return false;
   }
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  const rl =
+    existingRl ??
+    readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
   try {
     const answer = await rl.question(
       "\n[Consentimiento Requerido] ¿Deseas guardar estas observaciones en tu SQLite privado local? Escribe 'SI' para confirmar [SI/no]: ",
@@ -161,7 +164,9 @@ export async function promptOwnerConsentInTerminal(
     const normalized = answer.trim().toLowerCase();
     return normalized === "si" || normalized === "sí" || normalized === "yes";
   } finally {
-    rl.close();
+    if (!existingRl) {
+      rl.close();
+    }
   }
 }
 
