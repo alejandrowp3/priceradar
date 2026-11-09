@@ -17,6 +17,7 @@ export const DATABASE_TABLES = {
   priceObservations: "price_observations",
   discoveryTargets: "discovery_targets",
   scanRuns: "scan_runs",
+  scanRunProducts: "scan_run_products",
   opportunities: "opportunities",
   alertEvents: "alert_events",
   adminUsers: "admin_users",

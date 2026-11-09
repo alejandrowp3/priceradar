@@ -1105,6 +1105,15 @@ export class SqlitePrivateHistoryRepository {
 
       CREATE INDEX IF NOT EXISTS idx_opportunity_lifecycle_transitions_opportunity
         ON opportunity_lifecycle_transitions(opportunity_id, transition_id);
+
+      CREATE TABLE IF NOT EXISTS scan_run_products (
+        scan_run_id TEXT NOT NULL REFERENCES scan_runs(scan_run_id) ON DELETE CASCADE,
+        product_variant_key TEXT NOT NULL REFERENCES products(product_variant_key),
+        PRIMARY KEY (scan_run_id, product_variant_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_scan_run_products_product
+        ON scan_run_products(product_variant_key);
     `);
   }
 
@@ -1783,6 +1792,14 @@ export class SqlitePrivateHistoryRepository {
             last_seen_at = excluded.last_seen_at`,
         );
 
+        const insertScanRunProductStmt = this.db.prepare(
+          `INSERT INTO scan_run_products (
+            scan_run_id,
+            product_variant_key
+          ) VALUES (?, ?)
+          ON CONFLICT(scan_run_id, product_variant_key) DO NOTHING`,
+        );
+
         const insertObservationStmt = this.db.prepare(
           `INSERT INTO price_observations (
             observation_id,
@@ -1931,6 +1948,8 @@ export class SqlitePrivateHistoryRepository {
             rawListing.sourceObservedAt,
             rawListing.sourceObservedAt,
           );
+
+          insertScanRunProductStmt.run(context.scanRunId, productVariantKey);
 
           const listingKey = buildCanonicalListingKey({
             providerId: rawListing.providerId,
@@ -2802,7 +2821,23 @@ export class SqlitePrivateHistoryRepository {
           r.source_view_label as owner_label,
           MAX(r.started_at) as last_observed_at,
           COUNT(DISTINCT r.scan_run_id) as scan_runs_count,
-          COUNT(DISTINCT o.product_variant_key) as distinct_products_count,
+          (
+            SELECT COUNT(DISTINCT product_key)
+            FROM (
+              SELECT srp.product_variant_key as product_key
+              FROM scan_run_products srp
+              JOIN scan_runs r2 ON r2.scan_run_id = srp.scan_run_id
+              WHERE r2.status = 'SUCCEEDED'
+                AND COALESCE(r2.source_view_key, 'VISTA_DEFAULT') = COALESCE(r.source_view_key, 'VISTA_DEFAULT')
+              UNION
+              SELECT o2.product_variant_key as product_key
+              FROM price_observations o2
+              JOIN scan_runs r2 ON r2.scan_run_id = o2.scan_run_id
+              WHERE r2.status = 'SUCCEEDED'
+                AND o2.is_superseded = 0
+                AND COALESCE(r2.source_view_key, 'VISTA_DEFAULT') = COALESCE(r.source_view_key, 'VISTA_DEFAULT')
+            )
+          ) as distinct_products_count,
           COUNT(o.observation_id) as total_observations_count
         FROM scan_runs r
         LEFT JOIN price_observations o ON o.scan_run_id = r.scan_run_id AND o.is_superseded = 0

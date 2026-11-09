@@ -1684,6 +1684,149 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
   });
 
   describe("Phase P3 — Supervised Catalog Coverage & Multi-View Ingestion", () => {
+    it("F-P3-01 reproduction: per-view coverage loses products deduplicated across views within the same bucket", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+      const sameBucketIso = "2026-11-08T10:00:00.000Z";
+
+      // 1. Inspect View A containing products P1 and P2
+      const p1 = makeProvisionalListing({
+        externalProductId: "fp3-p1",
+        name: "Producto 1",
+        observedPriceCop: 10000,
+        sourceObservedAt: sameBucketIso,
+      });
+      const p2_viewA = makeProvisionalListing({
+        externalProductId: "fp3-p2",
+        name: "Producto 2",
+        observedPriceCop: 20000,
+        sourceObservedAt: sameBucketIso,
+      });
+
+      // 2. Persist View A
+      const resA = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([p1, p2_viewA], {
+          scanRunId: "scan-fp3-view-a",
+          observedAtIso: sameBucketIso,
+          sourceView: {
+            viewKey: "/tiendas/turbo/view-a",
+            pageKind: "STORE_SUBPATH",
+            ownerLabel: "Vista A",
+            domCardsBeforeCap: 2,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(resA.persisted).toBe(true);
+      expect(resA.observationsInserted).toBe(2);
+
+      // 3. Within the same idempotency bucket, inspect View B containing P2 and P3
+      // 4. Keep P2's price unchanged (20000) at sameBucketIso
+      const p2_viewB = makeProvisionalListing({
+        externalProductId: "fp3-p2",
+        name: "Producto 2",
+        observedPriceCop: 20000,
+        sourceObservedAt: sameBucketIso,
+      });
+      const p3 = makeProvisionalListing({
+        externalProductId: "fp3-p3",
+        name: "Producto 3",
+        observedPriceCop: 30000,
+        sourceObservedAt: sameBucketIso,
+      });
+
+      // 5. Persist View B
+      const resB = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([p2_viewB, p3], {
+          scanRunId: "scan-fp3-view-b",
+          observedAtIso: sameBucketIso,
+          sourceView: {
+            viewKey: "/tiendas/turbo/view-b",
+            pageKind: "STORE_SUBPATH",
+            ownerLabel: "Vista B",
+            domCardsBeforeCap: 2,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(resB.persisted).toBe(true);
+      // P2 was deduplicated (skipped duplicate), only P3 was newly inserted
+      expect(resB.observationsInserted).toBe(1);
+      expect(resB.observationsSkippedDuplicate).toBe(1);
+
+      // Assertions
+      const coverage = repo.getCatalogCoverageReport();
+
+      // 6. Assert global products = 3
+      expect(coverage.totalDistinctProducts).toBe(3);
+
+      // 9. Assert only 3 price observations were inserted
+      expect(coverage.totalActiveObservations).toBe(3);
+
+      const viewA = coverage.views.find((v) => v.viewKey === "/tiendas/turbo/view-a");
+      const viewB = coverage.views.find((v) => v.viewKey === "/tiendas/turbo/view-b");
+
+      // 7. Assert View A observed products = 2
+      expect(viewA?.distinctProductsCount).toBe(2);
+
+      // 8. Assert View B observed products = 2 (Demonstrating failure: returns 1 without fix)
+      expect(viewB?.distinctProductsCount).toBe(2);
+
+      repo.close();
+    });
+
+    it("conservatively counts legacy scan runs without scan_run_products using price_observations fallback", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      const p1 = makeProvisionalListing({
+        externalProductId: "leg-1",
+        observedPriceCop: 10000,
+      });
+      const p2 = makeProvisionalListing({
+        externalProductId: "leg-2",
+        observedPriceCop: 20000,
+      });
+
+      repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([p1, p2], {
+          scanRunId: "legacy-scan-1",
+          sourceView: {
+            viewKey: "/tiendas/turbo/legacy-view",
+            pageKind: "STORE_SUBPATH",
+            ownerLabel: "Legacy",
+            domCardsBeforeCap: 2,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+
+      // Simulate a legacy run where scan_run_products was not populated (clear scan_run_products for this run)
+      const internalDb = (
+        repo as unknown as {
+          db: { prepare: (sql: string) => { run: (id: string) => void } };
+        }
+      ).db;
+      internalDb
+        .prepare("DELETE FROM scan_run_products WHERE scan_run_id = ?")
+        .run("legacy-scan-1");
+
+      const coverage = repo.getCatalogCoverageReport();
+      const legacyView = coverage.views.find(
+        (v) => v.viewKey === "/tiendas/turbo/legacy-view",
+      );
+
+      // Must conservatively fall back to price_observations count (2 products)
+      expect(legacyView?.distinctProductsCount).toBe(2);
+      expect(legacyView?.totalObservationsCount).toBe(2);
+
+      repo.close();
+    });
+
     it("reports new vs previously known products in batch preview and updates on progressive views", () => {
       const repo = new SqlitePrivateHistoryRepository(dbPath);
 
