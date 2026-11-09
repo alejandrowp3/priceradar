@@ -8,6 +8,7 @@ out/
 dist/
 build/
 coverage/
+!apps/web/src/app/coverage/
 *.tsbuildinfo
 
 # Environment variables and secrets
