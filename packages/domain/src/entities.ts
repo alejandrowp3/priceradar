@@ -138,3 +138,23 @@ export function buildObservationIdempotencyKey(params: {
 }): string {
   return `${params.listingKey}::${String(params.observedPriceCop)}::${params.bucketTimestampIso}`;
 }
+
+/**
+ * Structural classification of an inspected catalog corridor or storefront path (`P3`).
+ */
+export type SourceViewPageKind = "STORE_ROOT" | "STORE_SUBPATH" | "OTHER";
+
+export interface SourceViewDescriptor {
+  /** Sanitized pathname plus a short allowlist of non-sensitive query parameters. */
+  readonly viewKey: string;
+  readonly pageKind: SourceViewPageKind;
+  /** Next.js route template exposed by `#__NEXT_DATA__.page` (if present). */
+  readonly nextDataRoute?: string;
+  /** Grouped product cards found in the DOM before the per-view cap was applied. */
+  readonly domCardsBeforeCap?: number;
+  /** `true` when the view had more cards than the inspector reads. */
+  readonly domCardCapReached?: boolean;
+  /** Category or view label explicitly provided by the owner. */
+  readonly ownerLabel?: string;
+  readonly labelSource: "OWNER_PROVIDED" | "NONE";
+}

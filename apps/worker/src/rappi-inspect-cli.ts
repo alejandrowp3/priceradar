@@ -10,12 +10,17 @@ import {
 } from "@priceradar/database";
 import type { PriceObservationRecord } from "@priceradar/domain";
 import { buildCanonicalListingKey, createCopAmount, formatCop } from "@priceradar/domain";
-import type { ExtractedNameSource, RawStorefrontSnapshot } from "@priceradar/providers";
+import type {
+  ExtractedNameSource,
+  RawStorefrontSnapshot,
+  SourceViewDescriptor,
+} from "@priceradar/providers";
 import {
   RAPPI_BROWSER_PROVIDER_ID,
   readEnvVarFromFile,
   resolveOrProvisionContextHmacSecret,
   SupervisedBrowserSnapshotProvider,
+  buildSourceViewDescriptor,
 } from "@priceradar/providers";
 import { executePrivateHistoryCliCommand } from "./private-history-cli.ts";
 import { executeDiscoveryScan } from "./scanner.ts";
@@ -35,6 +40,8 @@ interface CliOptions {
   readonly saveToPrivateHistory: boolean;
   readonly dbPath: string;
   readonly startUrl: string;
+  readonly label?: string;
+  readonly interactiveLoop: boolean;
 }
 
 interface SanitizedUiEvidenceDiagnostics {
@@ -48,6 +55,8 @@ interface SanitizedUiEvidenceDiagnostics {
   readonly nextDataSeoCity?: string;
   readonly nextDataFallbackProductCount: number;
   readonly rawDomAnchorCount: number;
+  readonly domCardsBeforeCap?: number;
+  readonly domCardCapReached?: boolean;
   readonly groupedDomCardCount: number;
   readonly duplicateDomAnchorsMergedCount: number;
   readonly domCatalogDiffersFromStaticHydration: boolean;
@@ -55,6 +64,7 @@ interface SanitizedUiEvidenceDiagnostics {
   readonly hasOutOfCoverageWarningInDom: boolean;
   readonly openedFromAddressDirectoryContext: boolean;
   readonly sanitizedNavigationPathHistory: readonly string[];
+  readonly sourceView?: SourceViewDescriptor;
   readonly liveUiVerificationSummary: {
     readonly activeAddressSelectionInLiveDom:
       "DETECTED_IN_HEADER" | "NOT_DETECTED_IN_HEADER";
@@ -75,6 +85,8 @@ function parseCliArgs(args: readonly string[]): CliOptions {
   let saveToPrivateHistory = false;
   let dbPath = DEFAULT_PRIVATE_SQLITE_DB_PATH;
   let startUrl = "https://www.rappi.com.co/tiendas/tipo/market";
+  let label: string | undefined;
+  let interactiveLoop = false;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -92,6 +104,11 @@ function parseCliArgs(args: readonly string[]): CliOptions {
       previewPrivateHistory = true;
     } else if (arg === "--save") {
       saveToPrivateHistory = true;
+    } else if (arg === "--interactive-loop" || arg === "--loop") {
+      interactiveLoop = true;
+    } else if ((arg === "--label" || arg === "--category-label") && args[i + 1]) {
+      label = args[i + 1];
+      i += 1;
     } else if (arg === "--db-path" && args[i + 1]) {
       dbPath = args[i + 1] ?? dbPath;
       i += 1;
@@ -111,6 +128,8 @@ function parseCliArgs(args: readonly string[]): CliOptions {
     saveToPrivateHistory,
     dbPath,
     startUrl,
+    ...(label !== undefined ? { label } : {}),
+    interactiveLoop,
   };
 }
 
@@ -278,6 +297,7 @@ async function captureReadOnlyDomSnapshotFromPage(
   navigationOptions?: {
     readonly sanitizedNavigationPathHistory?: readonly string[];
     readonly allowProvisionalSessionObservations?: boolean;
+    readonly ownerLabel?: string;
   },
 ): Promise<{
   readonly snapshot: RawStorefrontSnapshot;
@@ -409,6 +429,8 @@ async function captureReadOnlyDomSnapshotFromPage(
       }
     }
 
+    const domCardsBeforeCap = groupedByCardRoot.size;
+    const domCardCapReached = domCardsBeforeCap > 120;
     const groupedEntries = Array.from(groupedByCardRoot.entries()).slice(0, 120);
     let duplicateDomAnchorsMergedCount = 0;
 
@@ -523,6 +545,8 @@ async function captureReadOnlyDomSnapshotFromPage(
       hasDeliveryEtaBadgeInDom,
       hasOutOfCoverageWarningInDom,
       rawDomAnchorCount,
+      domCardsBeforeCap,
+      domCardCapReached,
       groupedDomCardCount: rawCards.length,
       duplicateDomAnchorsMergedCount,
       nextDataJson,
@@ -619,6 +643,18 @@ async function captureReadOnlyDomSnapshotFromPage(
     !domPayload.hasOutOfCoverageWarningInDom &&
     (hasDirectoryInPathHistory || hasSpaTransitionFromDirectory);
 
+  const sourceView = buildSourceViewDescriptor({
+    pageUrl,
+    ...(nextDataPageRoute !== undefined ? { nextDataRoute: nextDataPageRoute } : {}),
+    ...(domPayload.domCardsBeforeCap !== undefined
+      ? { domCardsBeforeCap: domPayload.domCardsBeforeCap }
+      : {}),
+    domCardCap: 120,
+    ...(navigationOptions?.ownerLabel !== undefined
+      ? { ownerLabel: navigationOptions.ownerLabel }
+      : {}),
+  });
+
   // Fail-closed: Do NOT fabricate servingBranchId or isServingBranchVerifiedForContext on live pages
   // because Rappi's DOM does not expose an explicit attribute binding the URL store_id to the header address.
   const snapshot: RawStorefrontSnapshot = {
@@ -647,6 +683,7 @@ async function captureReadOnlyDomSnapshotFromPage(
     ...(domPayload.nextDataJson !== undefined
       ? { nextDataJson: domPayload.nextDataJson }
       : {}),
+    ...(sourceView !== undefined ? { sourceView } : {}),
     rawCards: domPayload.rawCards.map((c) => ({
       ...(c.name !== undefined ? { name: c.name } : {}),
       ...(c.nameSource !== undefined ? { nameSource: c.nameSource } : {}),
@@ -675,6 +712,8 @@ async function captureReadOnlyDomSnapshotFromPage(
     ...(nextDataSeoCity !== undefined ? { nextDataSeoCity } : {}),
     nextDataFallbackProductCount,
     rawDomAnchorCount: domPayload.rawDomAnchorCount,
+    domCardsBeforeCap: domPayload.domCardsBeforeCap,
+    domCardCapReached: domPayload.domCardCapReached,
     groupedDomCardCount: domPayload.groupedDomCardCount,
     duplicateDomAnchorsMergedCount: domPayload.duplicateDomAnchorsMergedCount,
     domCatalogDiffersFromStaticHydration,
@@ -682,6 +721,7 @@ async function captureReadOnlyDomSnapshotFromPage(
     hasOutOfCoverageWarningInDom: domPayload.hasOutOfCoverageWarningInDom,
     openedFromAddressDirectoryContext,
     sanitizedNavigationPathHistory,
+    ...(sourceView !== undefined ? { sourceView } : {}),
     liveUiVerificationSummary: {
       activeAddressSelectionInLiveDom: domPayload.hasActiveDeliverySelector
         ? "DETECTED_IN_HEADER"
@@ -839,6 +879,156 @@ async function runSupervisedBrowserPoc(): Promise<void> {
       await page.goto(options.startUrl, { waitUntil: "domcontentloaded" });
       recordSanitizedPath(page.url());
 
+      if (options.interactiveLoop) {
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
+
+        let currentLabel = options.label;
+        let iteration = 1;
+        const sessionStats = {
+          viewsInspected: 0,
+          observationsInserted: 0,
+          opportunitiesInserted: 0,
+          newProductsDiscovered: 0,
+        };
+
+        try {
+          while (true) {
+            if (!options.nonInteractiveInspect) {
+              const promptMsg =
+                iteration === 1
+                  ? "\n[Acción Requerida] Selecciona tu dirección de entrega y abre una vista de tienda/categoría en Chromium, luego presiona ENTER aquí para inspeccionar..."
+                  : "\n[Siguiente vista] Navega en Chromium a otra categoría o vista de catálogo.\nPresiona ENTER para inspeccionar (o escribe una etiqueta opcional), o escribe 'salir' para terminar [ENTER / etiqueta / 'salir']: ";
+              const inputAnswer = (await rl.question(promptMsg)).trim();
+              if (
+                iteration > 1 &&
+                (inputAnswer.toLowerCase() === "salir" ||
+                  inputAnswer.toLowerCase() === "exit")
+              ) {
+                console.log(
+                  "\nFinalizando sesión interactiva supervisada de catálogo...",
+                );
+                break;
+              }
+              if (iteration > 1 && inputAnswer.length > 0) {
+                currentLabel = inputAnswer;
+              }
+            }
+
+            recordSanitizedPath(page.url());
+
+            const captured = await captureReadOnlyDomSnapshotFromPage(
+              page,
+              new Date().toISOString(),
+              contextHmacSecret,
+              {
+                sanitizedNavigationPathHistory: navigationHistory,
+                allowProvisionalSessionObservations:
+                  options.allowProvisionalSessionObservations,
+                ...(currentLabel !== undefined ? { ownerLabel: currentLabel } : {}),
+              },
+            );
+
+            sessionStats.viewsInspected += 1;
+
+            if (options.previewPrivateHistory || options.saveToPrivateHistory) {
+              const privateCliResult = await executePrivateHistoryCliCommand({
+                command: options.saveToPrivateHistory ? "save" : "preview",
+                dbPath: options.dbPath,
+                snapshot: captured.snapshot,
+              });
+
+              console.log(
+                JSON.stringify(
+                  {
+                    service: "priceradar-rappi-inspect",
+                    iteration,
+                    viewKey: captured.snapshot.sourceView?.viewKey,
+                    ownerLabel: captured.snapshot.sourceView?.ownerLabel,
+                    privateHistoryAction: {
+                      command: privateCliResult.command,
+                      titleEsCo: privateCliResult.titleEsCo,
+                      messageEsCo: privateCliResult.messageEsCo,
+                      ...privateCliResult.payload,
+                    },
+                  },
+                  null,
+                  2,
+                ),
+              );
+
+              const res = (privateCliResult.payload as Record<string, unknown>)
+                ?.result as
+                | {
+                    observationsInserted?: number;
+                    opportunitiesInserted?: number;
+                    newProductsDiscovered?: number;
+                  }
+                | undefined;
+
+              if (res) {
+                sessionStats.observationsInserted += res.observationsInserted ?? 0;
+                sessionStats.opportunitiesInserted += res.opportunitiesInserted ?? 0;
+                sessionStats.newProductsDiscovered += res.newProductsDiscovered ?? 0;
+              }
+
+              console.log(
+                `\n[Progreso de Sesión] Vistas inspeccionadas: ${String(sessionStats.viewsInspected)} | Nuevos productos descubiertos: ${String(sessionStats.newProductsDiscovered)} | Observaciones guardadas: ${String(sessionStats.observationsInserted)}`,
+              );
+            } else {
+              const provider = new SupervisedBrowserSnapshotProvider(captured.snapshot);
+              const r = provider.getInspectionReport();
+              console.log(
+                JSON.stringify(
+                  {
+                    service: "priceradar-rappi-inspect",
+                    iteration,
+                    gateStatus: r.gateStatus,
+                    gateMessage: r.gateMessage,
+                    pageUrl: r.pageUrl,
+                    sourceView: captured.snapshot.sourceView,
+                    candidateListings: r.listings.length,
+                  },
+                  null,
+                  2,
+                ),
+              );
+            }
+
+            if (options.nonInteractiveInspect) {
+              break;
+            }
+
+            iteration += 1;
+          }
+        } finally {
+          rl.close();
+        }
+
+        console.log(
+          "================================================================================",
+        );
+        console.log("Resumen de Sesión de Cobertura Supervisada:");
+        console.log(
+          `- Vistas inspeccionadas          : ${String(sessionStats.viewsInspected)}`,
+        );
+        console.log(
+          `- Nuevos productos descubiertos  : ${String(sessionStats.newProductsDiscovered)}`,
+        );
+        console.log(
+          `- Observaciones guardadas        : ${String(sessionStats.observationsInserted)}`,
+        );
+        console.log(
+          `- Oportunidades guardadas        : ${String(sessionStats.opportunitiesInserted)}`,
+        );
+        console.log(
+          "================================================================================",
+        );
+        return;
+      }
+
       if (!options.nonInteractiveInspect) {
         const rl = readline.createInterface({
           input: process.stdin,
@@ -859,6 +1049,7 @@ async function runSupervisedBrowserPoc(): Promise<void> {
           sanitizedNavigationPathHistory: navigationHistory,
           allowProvisionalSessionObservations:
             options.allowProvisionalSessionObservations,
+          ...(options.label !== undefined ? { ownerLabel: options.label } : {}),
         },
       );
       snapshot = captured.snapshot;

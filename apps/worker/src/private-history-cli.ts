@@ -17,13 +17,14 @@ import type {
 import { inspectStorefrontSnapshot } from "@priceradar/providers";
 
 export type PrivateHistoryCliCommandName =
-  "status" | "runs" | "product" | "drops" | "anomalies" | "preview" | "save";
+  "status" | "runs" | "product" | "drops" | "anomalies" | "coverage" | "preview" | "save";
 
 export interface PrivateHistoryCliExecutionInput {
   readonly command: PrivateHistoryCliCommandName;
   readonly dbPath?: string;
   readonly productQuery?: string;
   readonly limit?: number;
+  readonly staleDays?: number;
   readonly snapshot?: RawStorefrontSnapshot;
   readonly scanRunId?: string;
   /**
@@ -95,6 +96,7 @@ export function buildSupervisedPersistenceContextFromSnapshot(
     skippedMalformedCount: provisionalReport.skippedMalformedCount,
     duplicateSuppressedCount: provisionalReport.duplicateSuppressedCount,
     listings: provisionalReport.listings,
+    ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
   };
 
   return { strictReport, persistenceContext };
@@ -126,11 +128,13 @@ export function formatRedactedConsentSummaryEsCo(
     "================================================================================",
     `Base de datos destino : ${dbPath}`,
     `Tienda observada      : ${preview.storeName ?? "Desconocida"} (${preview.storeId ?? "N/A"})`,
+    `Vista de catálogo     : ${preview.sourceView?.ownerLabel ? `${preview.sourceView.ownerLabel} (${preview.sourceView.viewKey})` : (preview.sourceView?.viewKey ?? "Desconocida")}`,
     `Contexto opaco (HMAC) : ${preview.fulfillmentContextId ?? "N/A"} (sin dirección en texto plano)`,
     `Origen / Proveniencia : ${preview.provenance ?? "N/A"}`,
     `Veredicto geográfico  : ${preview.geographicVerificationVerdict}`,
     `Precio verificado por dirección exacta : ${preview.addressSpecificPricingVerified ? "SÍ" : "NO (Provisional de sesión)"}`,
     `Tarjetas evaluadas    : ${String(preview.candidatesDiscoveredCount)} (Elegibles: ${String(preview.eligibleListingsCount)}, Omitidas: ${String(preview.skippedMalformedCount)}, Duplicadas en página: ${String(preview.duplicateSuppressedCount)})`,
+    `Productos en catálogo : Nuevos descubiertos=${String(preview.newProductsCount)}, Ya conocidos previamente=${String(preview.previouslyKnownProductsCount)}`,
     `Nuevas observaciones  : ${String(preview.newObservationsCount)} (Ya registradas idempotentes: ${String(preview.alreadyPersistedDuplicateCount)})`,
     `Comparación histórica : Primeras=${String(preview.firstObservationsCount)}, Bajadas=${String(preview.priceDecreasesCount)}, Subidas=${String(preview.priceIncreasesCount)}, Sin cambio=${String(preview.unchangedPricesCount)}`,
     `Oportunidades detectadas en lote : ${String(preview.candidateOpportunitiesCount)}`,
@@ -334,6 +338,19 @@ export async function executePrivateHistoryCliCommand(
       };
     }
 
+    if (input.command === "coverage") {
+      const coverage = repo.getCatalogCoverageReport({
+        ...(input.staleDays !== undefined ? { staleDays: input.staleDays } : {}),
+      });
+      return {
+        exitCode: 0,
+        command: "coverage",
+        titleEsCo: "Reporte de cobertura de catálogo supervisado",
+        messageEsCo: `Catálogo acumulado: ${String(coverage.totalDistinctProducts)} productos únicos (${String(coverage.totalDistinctVariants)} variantes) a través de ${String(coverage.totalInspectedViews)} vistas de tienda y ${String(coverage.totalScanRuns)} inspecciones.`,
+        payload: { coverage },
+      };
+    }
+
     if (!input.snapshot) {
       return {
         exitCode: 1,
@@ -379,11 +396,14 @@ export async function executePrivateHistoryCliCommand(
             duplicateSuppressedCount: preview.duplicateSuppressedCount,
             newObservationsCount: preview.newObservationsCount,
             alreadyPersistedDuplicateCount: preview.alreadyPersistedDuplicateCount,
+            newProductsCount: preview.newProductsCount,
+            previouslyKnownProductsCount: preview.previouslyKnownProductsCount,
             priceDecreasesCount: preview.priceDecreasesCount,
             priceIncreasesCount: preview.priceIncreasesCount,
             unchangedPricesCount: preview.unchangedPricesCount,
             firstObservationsCount: preview.firstObservationsCount,
             candidateOpportunitiesCount: preview.candidateOpportunitiesCount,
+            ...(preview.sourceView ? { sourceView: preview.sourceView } : {}),
           },
         },
       };
@@ -467,6 +487,7 @@ async function runCliFromArgv(): Promise<void> {
     "product",
     "drops",
     "anomalies",
+    "coverage",
     "preview",
     "save",
   ]);
@@ -477,7 +498,7 @@ async function runCliFromArgv(): Promise<void> {
         {
           service: "priceradar-private-history-cli",
           level: "ERROR",
-          messageEsCo: `Comando desconocido '${rawSubcommand}'. Comandos válidos: status, runs, product <id|nombre>, drops, anomalies.`,
+          messageEsCo: `Comando desconocido '${rawSubcommand}'. Comandos válidos: status, runs, product <id|nombre>, drops, anomalies, coverage.`,
         },
         null,
         2,
@@ -489,6 +510,7 @@ async function runCliFromArgv(): Promise<void> {
   let dbPath = DEFAULT_PRIVATE_SQLITE_DB_PATH;
   let productQuery: string | undefined;
   let limit = 20;
+  let staleDays: number | undefined;
 
   for (let i = 1; i < args.length; i += 1) {
     const arg = args[i];
@@ -497,6 +519,9 @@ async function runCliFromArgv(): Promise<void> {
       i += 1;
     } else if (arg === "--limit" && args[i + 1]) {
       limit = Number.parseInt(args[i + 1] ?? "20", 10) || 20;
+      i += 1;
+    } else if (arg === "--stale-days" && args[i + 1]) {
+      staleDays = Number.parseInt(args[i + 1] ?? "14", 10) || 14;
       i += 1;
     } else if (!arg?.startsWith("--") && !productQuery) {
       productQuery = arg;
@@ -508,6 +533,7 @@ async function runCliFromArgv(): Promise<void> {
     dbPath,
     ...(productQuery !== undefined ? { productQuery } : {}),
     limit,
+    ...(staleDays !== undefined ? { staleDays } : {}),
   });
 
   console.log(

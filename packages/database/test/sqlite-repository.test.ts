@@ -24,6 +24,8 @@ function makeProvisionalListing(
     externalProductId?: string;
     externalVariantId?: string;
     name?: string;
+    categorySlug?: string;
+    categoryName?: string;
     packagingLabel?: string;
     unitQuantity?: number;
     unitType?: "g" | "kg" | "ml" | "l" | "unit";
@@ -40,15 +42,15 @@ function makeProvisionalListing(
       providerId: "rappi-authenticated-inspector",
       externalStoreId: overrides.externalStoreId ?? "900130995-turbo-super",
       name: overrides.storeName ?? "Turbo Super",
-      categorySlug: "supermercados",
+      categorySlug: overrides.categorySlug ?? "supermercados",
     },
     variant: {
       externalProductId: overrides.externalProductId ?? "2111457819",
       externalVariantId: overrides.externalVariantId ?? "var-500ml",
       name: overrides.name ?? "Aceite de Oliva Extra Virgen",
       brand: "Carbonell",
-      categorySlug: "supermercados",
-      categoryName: "Supermercados",
+      categorySlug: overrides.categorySlug ?? "supermercados",
+      categoryName: overrides.categoryName ?? "Supermercados",
       packagingLabel: overrides.packagingLabel ?? "500 ml",
       unitQuantity: overrides.unitQuantity ?? 500,
       unitType: overrides.unitType ?? "ml",
@@ -117,6 +119,7 @@ function makeSupervisedBatchInput(
     skippedMalformedCount: overrides.skippedMalformedCount ?? 0,
     duplicateSuppressedCount: overrides.duplicateSuppressedCount ?? 0,
     listings,
+    ...(overrides.sourceView !== undefined ? { sourceView: overrides.sourceView } : {}),
   };
 }
 
@@ -1676,6 +1679,271 @@ describe("SqlitePrivateHistoryRepository — Phase P2 Storage, Privacy & Lifecyc
       expect(ok.persisted).toBe(true);
       const history = repo.getProductPriceHistory("fx-1000");
       expect(history[0]?.provenance).toBe("PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL");
+      repo.close();
+    });
+  });
+
+  describe("Phase P3 — Supervised Catalog Coverage & Multi-View Ingestion", () => {
+    it("reports new vs previously known products in batch preview and updates on progressive views", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      const prod1 = makeProvisionalListing({
+        externalProductId: "prod-1",
+        observedPriceCop: 10000,
+      });
+      const prod2 = makeProvisionalListing({
+        externalProductId: "prod-2",
+        observedPriceCop: 15000,
+      });
+      const prod3 = makeProvisionalListing({
+        externalProductId: "prod-3",
+        observedPriceCop: 20000,
+      });
+
+      // View 1 preview: all 3 products are new
+      const preview1 = repo.previewInspectionBatchAgainstHistory(
+        makeSupervisedBatchInput([prod1, prod2, prod3], {
+          scanRunId: "p3-scan-1",
+          sourceView: {
+            viewKey: "/tiendas/turbo",
+            pageKind: "STORE_ROOT",
+            domCardsBeforeCap: 3,
+            domCardCapReached: false,
+            labelSource: "NONE",
+          },
+        }),
+      );
+      expect(preview1.isEligible).toBe(true);
+      expect(preview1.newProductsCount).toBe(3);
+      expect(preview1.previouslyKnownProductsCount).toBe(0);
+      expect(preview1.sourceView?.pageKind).toBe("STORE_ROOT");
+
+      // Persist View 1
+      const save1 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([prod1, prod2, prod3], {
+          scanRunId: "p3-scan-1",
+          sourceView: {
+            viewKey: "/tiendas/turbo",
+            pageKind: "STORE_ROOT",
+            domCardsBeforeCap: 3,
+            domCardCapReached: false,
+            labelSource: "NONE",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(save1.persisted).toBe(true);
+      expect(save1.newProductsDiscovered).toBe(3);
+      expect(save1.existingProductsObserved).toBe(0);
+
+      // View 2 preview: prod2 and prod3 are already known; prod4 is new
+      const prod4 = makeProvisionalListing({
+        externalProductId: "prod-4",
+        observedPriceCop: 25000,
+      });
+      const preview2 = repo.previewInspectionBatchAgainstHistory(
+        makeSupervisedBatchInput([prod2, prod3, prod4], {
+          scanRunId: "p3-scan-2",
+          sourceView: {
+            viewKey: "/tiendas/turbo/lacteos",
+            pageKind: "STORE_SUBPATH",
+            ownerLabel: "Lácteos",
+            domCardsBeforeCap: 3,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED",
+          },
+        }),
+      );
+      expect(preview2.isEligible).toBe(true);
+      expect(preview2.newProductsCount).toBe(1);
+      expect(preview2.previouslyKnownProductsCount).toBe(2);
+
+      repo.close();
+    });
+
+    it("persists progressive multi-view sessions and generates comprehensive catalog coverage reports", () => {
+      const repo = new SqlitePrivateHistoryRepository(dbPath);
+
+      const makeListingAt = (
+        id: string,
+        name: string,
+        price: number,
+        iso: string,
+        categorySlug = "lacteos",
+      ) =>
+        makeProvisionalListing({
+          externalProductId: id,
+          name,
+          observedPriceCop: price,
+          sourceObservedAt: iso,
+          categorySlug,
+        });
+
+      const p1 = makeListingAt(
+        "p-1",
+        "Leche Entera 1000 ml",
+        4500,
+        "2026-11-08T10:00:00.000Z",
+        "lacteos",
+      );
+      const p2_v1 = makeListingAt(
+        "p-2",
+        "Yogurt Fresa 150 g",
+        3200,
+        "2026-11-08T10:00:00.000Z",
+        "lacteos",
+      );
+      const p3_v1 = makeListingAt(
+        "p-3",
+        "Queso Tajado 200 g",
+        8900,
+        "2026-11-08T10:00:00.000Z",
+        "lacteos",
+      );
+
+      const p2_v2 = makeListingAt(
+        "p-2",
+        "Yogurt Fresa 150 g",
+        3200,
+        "2026-11-08T10:05:00.000Z",
+        "lacteos",
+      );
+      const p3_v2 = makeListingAt(
+        "p-3",
+        "Queso Tajado 200 g",
+        8900,
+        "2026-11-08T10:05:00.000Z",
+        "lacteos",
+      );
+      const p4_v2 = makeListingAt(
+        "p-4",
+        "Jugo Naranja 1 L",
+        6500,
+        "2026-11-08T10:05:00.000Z",
+        "bebidas",
+      );
+
+      const p4_v3 = makeListingAt(
+        "p-4",
+        "Jugo Naranja 1 L",
+        6500,
+        "2026-11-08T10:10:00.000Z",
+        "bebidas",
+      );
+      const p5_v3 = makeListingAt(
+        "p-5",
+        "Café Molido 500 g",
+        28000,
+        "2026-11-08T10:10:00.000Z",
+        "despensa",
+      );
+
+      // Run 1: Store Root (p1, p2, p3)
+      const res1 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([p1, p2_v1, p3_v1], {
+          scanRunId: "scan-view-root",
+          observedAtIso: "2026-11-08T10:00:00.000Z",
+          sourceView: {
+            viewKey: "/tiendas/900130995-turbo-super",
+            pageKind: "STORE_ROOT",
+            domCardsBeforeCap: 3,
+            domCardCapReached: false,
+            labelSource: "NONE",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(res1.persisted).toBe(true);
+      expect(res1.newProductsDiscovered).toBe(3);
+      expect(res1.existingProductsObserved).toBe(0);
+
+      // Run 2: Category Lácteos (p2, p3, p4) -> 1 new (p4), 2 existing
+      const res2 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([p2_v2, p3_v2, p4_v2], {
+          scanRunId: "scan-view-lacteos",
+          observedAtIso: "2026-11-08T10:05:00.000Z",
+          sourceView: {
+            viewKey: "/tiendas/900130995-turbo-super/lacteos",
+            pageKind: "STORE_SUBPATH",
+            ownerLabel: "Lácteos y Quesos",
+            domCardsBeforeCap: 3,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(res2.persisted).toBe(true);
+      expect(res2.newProductsDiscovered).toBe(1);
+      expect(res2.existingProductsObserved).toBe(2);
+
+      // Run 3: Category Despensa (p4, p5) -> 1 new (p5), 1 existing
+      const res3 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([p4_v3, p5_v3], {
+          scanRunId: "scan-view-despensa",
+          observedAtIso: "2026-11-08T10:10:00.000Z",
+          sourceView: {
+            viewKey: "/tiendas/900130995-turbo-super/despensa",
+            pageKind: "STORE_SUBPATH",
+            ownerLabel: "Despensa y Café",
+            domCardsBeforeCap: 2,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(res3.persisted).toBe(true);
+      expect(res3.newProductsDiscovered).toBe(1);
+      expect(res3.existingProductsObserved).toBe(1);
+
+      // Verify listRecentScanRuns maps the view columns
+      const recentRuns = repo.listRecentScanRuns(5);
+      expect(recentRuns).toHaveLength(3);
+      expect(recentRuns[0]?.sourceViewKey).toBe(
+        "/tiendas/900130995-turbo-super/despensa",
+      );
+      expect(recentRuns[0]?.sourceViewLabel).toBe("Despensa y Café");
+      expect(recentRuns[0]?.newProductsDiscovered).toBe(1);
+      expect(recentRuns[0]?.existingProductsObserved).toBe(1);
+
+      // Generate Catalog Coverage Report
+      const coverage = repo.getCatalogCoverageReport();
+      expect(coverage.totalDistinctProducts).toBe(5);
+      expect(coverage.totalDistinctVariants).toBe(5);
+      expect(coverage.totalActiveObservations).toBe(8); // 3 + 3 + 2
+      expect(coverage.totalScanRuns).toBe(3);
+      expect(coverage.totalInspectedViews).toBe(3);
+      expect(coverage.views).toHaveLength(3);
+      expect(coverage.categories.length).toBeGreaterThanOrEqual(2);
+      expect(coverage.staleProductsCount).toBe(0);
+      expect(coverage.newestProductsSample.length).toBeLessThanOrEqual(10);
+      expect(coverage.newestProductsSample.length).toBeGreaterThan(0);
+
+      // Test stale detection with a tight threshold or backfilled past observation
+      const coverageWithStaleCheck = repo.getCatalogCoverageReport({ staleDays: 30 });
+      expect(coverageWithStaleCheck.staleProductsCount).toBe(0);
+
+      // Replay scan 2: must succeed idempotently without altering counters
+      const replay2 = repo.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([p2_v2, p3_v2, p4_v2], {
+          scanRunId: "scan-view-lacteos",
+          observedAtIso: "2026-11-08T10:05:00.000Z",
+          sourceView: {
+            viewKey: "/tiendas/900130995-turbo-super/lacteos",
+            pageKind: "STORE_SUBPATH",
+            ownerLabel: "Lácteos y Quesos",
+            domCardsBeforeCap: 3,
+            domCardCapReached: false,
+            labelSource: "OWNER_PROVIDED",
+          },
+        }),
+        { ownerConfirmed: true },
+      );
+      expect(replay2.persisted).toBe(true);
+      expect(replay2.idempotentReplay).toBe(true);
+      expect(replay2.observationsInserted).toBe(0);
+
       repo.close();
     });
   });

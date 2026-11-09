@@ -8,6 +8,8 @@ import type {
   DiscoveryTarget,
   GeographicContext,
   PriceObservationRecord,
+  SourceViewDescriptor,
+  SourceViewPageKind,
 } from "@priceradar/domain";
 import { buildCanonicalListingKey, createCopAmount } from "@priceradar/domain";
 import type {
@@ -169,6 +171,75 @@ export interface StorefrontExtractionDiagnostics {
   readonly missingGeographicEvidence: readonly string[];
 }
 
+export type { SourceViewDescriptor, SourceViewPageKind } from "@priceradar/domain";
+
+const SENSITIVE_VIEW_QUERY_KEY_REGEX =
+  /(?:token|session|sess|auth|cookie|secret|passw|pwd|jwt|bearer|credential|api[_-]?key|sid|signature|address|direccion|lat|lng|lon)/i;
+const SAFE_VIEW_QUERY_VALUE_REGEX = /^[\p{L}\p{N}_-]{1,40}$/u;
+
+/**
+ * Builds a sanitized, privacy-safe descriptor of the single view currently displayed (`P3`).
+ * Returns `undefined` when the URL is not a parseable Rappi Colombia page.
+ */
+export function buildSourceViewDescriptor(params: {
+  readonly pageUrl: string;
+  readonly nextDataRoute?: string;
+  readonly domCardsBeforeCap?: number;
+  readonly domCardCap?: number;
+  readonly ownerLabel?: string;
+}): SourceViewDescriptor | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(params.pageUrl);
+  } catch {
+    return undefined;
+  }
+  if (!parsed.hostname.endsWith("rappi.com.co")) return undefined;
+
+  const cleanPath = (parsed.pathname.replace(/\/+$/, "") || "/").slice(0, 200);
+  const safeQuery = [...parsed.searchParams.entries()]
+    .filter(
+      ([key, value]) =>
+        !SENSITIVE_VIEW_QUERY_KEY_REGEX.test(key) &&
+        /^[\p{L}\p{N}_-]{1,30}$/u.test(key) &&
+        SAFE_VIEW_QUERY_VALUE_REGEX.test(value),
+    )
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(0, 5)
+    .map(([key, value]) => `${key}=${value}`);
+  const viewKey =
+    safeQuery.length > 0 ? `${cleanPath}?${safeQuery.join("&")}` : cleanPath;
+
+  const segments = cleanPath.split("/").filter(Boolean);
+  const pageKind: SourceViewPageKind =
+    segments[0] === "tiendas" && segments.length === 2 && segments[1] !== "tipo"
+      ? "STORE_ROOT"
+      : segments[0] === "tiendas" && segments.length > 2 && segments[1] !== "tipo"
+        ? "STORE_SUBPATH"
+        : "OTHER";
+
+  const ownerLabel = params.ownerLabel?.replace(/\s+/g, " ").trim().slice(0, 60);
+  const hasLabel = ownerLabel !== undefined && ownerLabel.length > 0;
+
+  return {
+    viewKey,
+    pageKind,
+    ...(params.nextDataRoute !== undefined
+      ? { nextDataRoute: params.nextDataRoute }
+      : {}),
+    ...(params.domCardsBeforeCap !== undefined
+      ? {
+          domCardsBeforeCap: params.domCardsBeforeCap,
+          ...(params.domCardCap !== undefined
+            ? { domCardCapReached: params.domCardsBeforeCap > params.domCardCap }
+            : {}),
+        }
+      : {}),
+    ...(hasLabel ? { ownerLabel } : {}),
+    labelSource: hasLabel ? "OWNER_PROVIDED" : "NONE",
+  };
+}
+
 export interface RawStorefrontSnapshot {
   readonly pageUrl: string;
   readonly pageTitle?: string;
@@ -251,6 +322,12 @@ export interface RawStorefrontSnapshot {
    */
   readonly allowProvisionalSessionObservations?: boolean;
   readonly categorySlug?: string;
+  /**
+   * Observable description of the single catalog view that was inspected (`P3`).
+   * Built only from the page URL, the Next.js route template and owner-provided input;
+   * never from guessed selectors or private Rappi APIs.
+   */
+  readonly sourceView?: SourceViewDescriptor;
   readonly rawCards?: readonly RawDomProductCard[];
   /**
    * Optional raw `#__NEXT_DATA__` JSON string if present in the document.
@@ -303,6 +380,7 @@ export interface StorefrontInspectionReport {
   readonly listings: readonly DiscoveredListing[];
   readonly skippedMalformedCount: number;
   readonly duplicateSuppressedCount: number;
+  readonly sourceView?: SourceViewDescriptor;
 }
 
 const CHALLENGE_PATTERNS = [
@@ -1506,6 +1584,7 @@ export function inspectStorefrontSnapshot(
       listings: [],
       skippedMalformedCount: 0,
       duplicateSuppressedCount: 0,
+      ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
     };
   }
 
@@ -1522,6 +1601,7 @@ export function inspectStorefrontSnapshot(
       listings: [],
       skippedMalformedCount: 0,
       duplicateSuppressedCount: 0,
+      ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
     };
   }
 
@@ -1559,6 +1639,7 @@ export function inspectStorefrontSnapshot(
         listings: [],
         skippedMalformedCount: conflictingPriceCardsSkipped,
         duplicateSuppressedCount: 0,
+        ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
       };
     }
 
@@ -1585,6 +1666,7 @@ export function inspectStorefrontSnapshot(
       listings: [],
       skippedMalformedCount: conflictingPriceCardsSkipped,
       duplicateSuppressedCount: 0,
+      ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
     };
   }
 
@@ -1939,6 +2021,7 @@ export function inspectStorefrontSnapshot(
         listings,
         skippedMalformedCount,
         duplicateSuppressedCount,
+        ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
       };
     }
 
@@ -1955,6 +2038,7 @@ export function inspectStorefrontSnapshot(
       listings: [],
       skippedMalformedCount,
       duplicateSuppressedCount,
+      ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
     };
   }
 
@@ -1971,6 +2055,7 @@ export function inspectStorefrontSnapshot(
       listings: [],
       skippedMalformedCount,
       duplicateSuppressedCount,
+      ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
     };
   }
 
@@ -1985,6 +2070,7 @@ export function inspectStorefrontSnapshot(
     listings,
     skippedMalformedCount,
     duplicateSuppressedCount,
+    ...(snapshot.sourceView !== undefined ? { sourceView: snapshot.sourceView } : {}),
   };
 }
 
