@@ -628,4 +628,254 @@ describe("Dashboard Query Methods & Read-Only Repository (Phase P4)", () => {
       writer.close();
     });
   });
+
+  describe("F5-02: Multi-variant disambiguation and safe URL lookups", () => {
+    it("returns separate detail views for different variants sharing the same externalProductId", () => {
+      const writer = new SqlitePrivateHistoryRepository(dbPath);
+
+      // Seed 2 variants of the same product: 200ml ($15.000) and 400ml ($25.000)
+      const listings = [
+        makeProvisionalListing({
+          externalProductId: "shampoo-100",
+          externalVariantId: "shampoo-100-200ml",
+          name: "Shampoo Anticaspa 200ml",
+          observedPriceCop: 15000,
+          sourceObservedAt: "2026-11-09T10:00:00.000Z",
+        }),
+        makeProvisionalListing({
+          externalProductId: "shampoo-100",
+          externalVariantId: "shampoo-100-400ml",
+          name: "Shampoo Anticaspa 400ml",
+          observedPriceCop: 25000,
+          sourceObservedAt: "2026-11-09T10:00:00.000Z",
+        }),
+      ];
+
+      const batch = makeSupervisedBatchInput(listings, { scanRunId: "scan-var-1" });
+      writer.persistApprovedInspectionBatch(batch, { ownerConfirmed: true });
+
+      const variantKey200 =
+        "rappi-authenticated-inspector::shampoo-100::shampoo-100-200ml";
+      const variantKey400 =
+        "rappi-authenticated-inspector::shampoo-100::shampoo-100-400ml";
+
+      // 1. Exact variant lookup for 200ml
+      const detail200 = writer.getProductDetail(variantKey200);
+      expect(detail200).toBeDefined();
+      expect(detail200?.product.productName).toBe("Shampoo Anticaspa 200ml");
+      expect(detail200?.product.productVariantKey).toBe(variantKey200);
+      expect(detail200?.statistics.currentPriceCop).toBe(15000);
+      expect(detail200?.observations).toHaveLength(1);
+      expect(detail200?.observations[0]?.observedPriceCop).toBe(15000);
+
+      // 2. Exact variant lookup for 400ml
+      const detail400 = writer.getProductDetail(variantKey400);
+      expect(detail400).toBeDefined();
+      expect(detail400?.product.productName).toBe("Shampoo Anticaspa 400ml");
+      expect(detail400?.product.productVariantKey).toBe(variantKey400);
+      expect(detail400?.statistics.currentPriceCop).toBe(25000);
+      expect(detail400?.observations).toHaveLength(1);
+      expect(detail400?.observations[0]?.observedPriceCop).toBe(25000);
+
+      // 3. Ambiguous bare externalProductId lookup returns undefined when >1 variants exist
+      const ambiguousDetail = writer.getProductDetail("shampoo-100");
+      expect(ambiguousDetail).toBeUndefined();
+
+      writer.close();
+    });
+
+    it("safely resolves bare externalProductId if exactly one variant exists in the database", () => {
+      const writer = new SqlitePrivateHistoryRepository(dbPath);
+
+      const listing = makeProvisionalListing({
+        externalProductId: "unique-prod-999",
+        externalVariantId: "unique-prod-999-std",
+        name: "Aceite de Oliva 500ml",
+        observedPriceCop: 38000,
+      });
+
+      writer.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput([listing], { scanRunId: "scan-unique-1" }),
+        { ownerConfirmed: true },
+      );
+
+      // Querying by bare externalProductId succeeds because there is exactly 1 variant
+      const detail = writer.getProductDetail("unique-prod-999");
+      expect(detail).toBeDefined();
+      expect(detail?.product.productName).toBe("Aceite de Oliva 500ml");
+      expect(detail?.product.externalProductId).toBe("unique-prod-999");
+
+      writer.close();
+    });
+  });
+
+  describe("F5-03: Direct opportunity lookup avoids global truncation and variant mixing", () => {
+    it("retrieves active opportunity without being truncated by global limits when >50 opportunities exist", () => {
+      const writer = new SqlitePrivateHistoryRepository(dbPath);
+
+      // 1. Create baseline for 55 products
+      const count = 55;
+      const baseListings: DiscoveredListing[] = [];
+      for (let i = 1; i <= count; i++) {
+        baseListings.push(
+          makeProvisionalListing({
+            externalProductId: `bulk-prod-${i.toString().padStart(3, "0")}`,
+            name: `Bulk Product ${i}`,
+            observedPriceCop: 100000,
+            sourceObservedAt: "2026-11-07T10:00:00.000Z",
+          }),
+        );
+      }
+      writer.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(baseListings, {
+          scanRunId: "scan-bulk-base",
+          observedAtIso: "2026-11-07T10:00:00.000Z",
+        }),
+        { ownerConfirmed: true },
+      );
+
+      // Baseline 2
+      const baseListings2 = baseListings.map((l) => ({
+        ...l,
+        sourceObservedAt: "2026-11-08T10:00:00.000Z",
+      }));
+      writer.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(baseListings2, {
+          scanRunId: "scan-bulk-base2",
+          observedAtIso: "2026-11-08T10:00:00.000Z",
+        }),
+        { ownerConfirmed: true },
+      );
+
+      // 2. Price drop for all 55 products to trigger 55 ACTIVE opportunities
+      const dropListings: DiscoveredListing[] = [];
+      for (let i = 1; i <= count; i++) {
+        dropListings.push(
+          makeProvisionalListing({
+            externalProductId: `bulk-prod-${i.toString().padStart(3, "0")}`,
+            name: `Bulk Product ${i}`,
+            observedPriceCop: 80000,
+            declaredReferencePriceCop: 100000,
+            sourceObservedAt: "2026-11-09T10:00:00.000Z",
+          }),
+        );
+      }
+      writer.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(dropListings, {
+          scanRunId: "scan-bulk-drop",
+          observedAtIso: "2026-11-09T10:00:00.000Z",
+        }),
+        { ownerConfirmed: true },
+      );
+
+      // Total active opportunities should be >50 (both drops and historical lows generated)
+      const allActive = writer.listActiveOpportunities({ pageSize: 100 });
+      expect(allActive.totalCount).toBeGreaterThanOrEqual(55);
+
+      // Verify that the 55th product's detail STILL retrieves its active opportunity
+      const targetVariantKey =
+        "rappi-authenticated-inspector::bulk-prod-055::bulk-prod-055-std";
+      const targetDetail = writer.getProductDetail(targetVariantKey);
+
+      expect(targetDetail).toBeDefined();
+      expect(targetDetail?.activeOpportunities.length).toBeGreaterThanOrEqual(1);
+      const activeOpp = targetDetail?.activeOpportunities[0];
+      expect(activeOpp?.externalProductId).toBe("bulk-prod-055");
+      expect(activeOpp?.opportunityType).toBe("HISTORICAL_LOW");
+      expect(activeOpp?.discountPercentage).toBe(20);
+
+      writer.close();
+    });
+
+    it("keeps active opportunities strictly scoped to their variant without cross-contamination", () => {
+      const writer = new SqlitePrivateHistoryRepository(dbPath);
+
+      // Variant A and Variant B of the same external product
+      const variantKeyA = "rappi-authenticated-inspector::split-prod::split-prod-A";
+      const variantKeyB = "rappi-authenticated-inspector::split-prod::split-prod-B";
+
+      // Baseline 1
+      writer.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "split-prod",
+              externalVariantId: "split-prod-A",
+              name: "Split Product Variant A",
+              observedPriceCop: 50000,
+              sourceObservedAt: "2026-11-07T10:00:00.000Z",
+            }),
+            makeProvisionalListing({
+              externalProductId: "split-prod",
+              externalVariantId: "split-prod-B",
+              name: "Split Product Variant B",
+              observedPriceCop: 80000,
+              sourceObservedAt: "2026-11-07T10:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-split-base1", observedAtIso: "2026-11-07T10:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+
+      // Baseline 2
+      writer.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "split-prod",
+              externalVariantId: "split-prod-A",
+              name: "Split Product Variant A",
+              observedPriceCop: 50000,
+              sourceObservedAt: "2026-11-08T10:00:00.000Z",
+            }),
+            makeProvisionalListing({
+              externalProductId: "split-prod",
+              externalVariantId: "split-prod-B",
+              name: "Split Product Variant B",
+              observedPriceCop: 80000,
+              sourceObservedAt: "2026-11-08T10:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-split-base2", observedAtIso: "2026-11-08T10:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+
+      // Only Variant A drops in price (50.000 -> 35.000)
+      writer.persistApprovedInspectionBatch(
+        makeSupervisedBatchInput(
+          [
+            makeProvisionalListing({
+              externalProductId: "split-prod",
+              externalVariantId: "split-prod-A",
+              name: "Split Product Variant A",
+              observedPriceCop: 35000,
+              declaredReferencePriceCop: 50000,
+              sourceObservedAt: "2026-11-09T10:00:00.000Z",
+            }),
+            makeProvisionalListing({
+              externalProductId: "split-prod",
+              externalVariantId: "split-prod-B",
+              name: "Split Product Variant B",
+              observedPriceCop: 80000,
+              sourceObservedAt: "2026-11-09T10:00:00.000Z",
+            }),
+          ],
+          { scanRunId: "scan-split-drop", observedAtIso: "2026-11-09T10:00:00.000Z" },
+        ),
+        { ownerConfirmed: true },
+      );
+
+      const detailA = writer.getProductDetail(variantKeyA);
+      expect(detailA?.activeOpportunities.length).toBeGreaterThanOrEqual(1);
+      expect(detailA?.activeOpportunities[0]?.productVariantKey).toBe(variantKeyA);
+      expect(detailA?.activeOpportunities[0]?.discountPercentage).toBe(30);
+
+      const detailB = writer.getProductDetail(variantKeyB);
+      expect(detailB?.activeOpportunities).toHaveLength(0);
+
+      writer.close();
+    });
+  });
 });

@@ -7,11 +7,11 @@ import {
 import type {
   CatalogCoverageReport,
   CatalogProductSummaryItem,
+  DashboardOpportunityItem,
   DashboardSummary,
   ListActiveOpportunitiesOptions,
   ListCatalogProductsOptions,
   PaginatedResult,
-  PersistedOpportunityEventRow,
   ProductDetailView,
 } from "@priceradar/database";
 
@@ -89,7 +89,7 @@ export function fetchProductDetail(productIdOrKey: string): {
 }
 
 export function fetchActiveOpportunities(options?: ListActiveOpportunitiesOptions): {
-  readonly result: PaginatedResult<PersistedOpportunityEventRow> | null;
+  readonly result: PaginatedResult<DashboardOpportunityItem> | null;
   readonly dbExists: boolean;
 } {
   const { repo, dbExists } = getReadOnlyDatabase();

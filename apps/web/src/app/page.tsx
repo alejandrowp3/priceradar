@@ -25,6 +25,7 @@ export default function OverviewPage() {
 
   const latestObservedDate = summary.latestObservationAt
     ? new Date(summary.latestObservationAt).toLocaleString("es-CO", {
+        timeZone: "America/Bogota",
         month: "short",
         day: "numeric",
         hour: "2-digit",

@@ -614,4 +614,176 @@ describe("Phase P4 — Dashboard 12 Functional & Security Scenarios", () => {
       );
     }).toThrow(/Cannot perform 'persistApprovedInspectionBatch' on a read-only database/);
   });
+
+  // 13. Scenario 13: Strict serialization audit — Client Component payloads and RSC outputs contain ZERO fulfillment context hashes or compound IDs (F5-01)
+  it("Scenario 13: F5-01 strict serialization audit guarantees zero context hashes or compound IDs leak into RSC/client payloads", () => {
+    const writer = new SqlitePrivateHistoryRepository(dbPath);
+
+    // Seed 2 scans to produce observations and an active opportunity
+    writer.persistApprovedInspectionBatch(
+      makeSupervisedBatchInput(
+        [
+          makeProvisionalListing({
+            externalProductId: "privacy-leak-test",
+            name: "Aceite Gourmet 1L",
+            observedPriceCop: 25000,
+            sourceObservedAt: "2026-11-08T10:00:00.000Z",
+          }),
+        ],
+        { scanRunId: "scan-audit-1", observedAtIso: "2026-11-08T10:00:00.000Z" },
+      ),
+      { ownerConfirmed: true },
+    );
+
+    writer.persistApprovedInspectionBatch(
+      makeSupervisedBatchInput(
+        [
+          makeProvisionalListing({
+            externalProductId: "privacy-leak-test",
+            name: "Aceite Gourmet 1L",
+            observedPriceCop: 20000,
+            declaredReferencePriceCop: 25000,
+            sourceObservedAt: "2026-11-09T10:00:00.000Z",
+          }),
+        ],
+        { scanRunId: "scan-audit-2", observedAtIso: "2026-11-09T10:00:00.000Z" },
+      ),
+      { ownerConfirmed: true },
+    );
+    writer.close();
+
+    // 1. Audit fetchProductDetail
+    const { detail } = fetchProductDetail("privacy-leak-test");
+    expect(detail).toBeDefined();
+    const detailJson = JSON.stringify(detail);
+
+    // Context hash regex: ctx-[0-9a-f]{16}
+    const contextHashRegex = /ctx-[0-9a-f]{16}/i;
+    expect(contextHashRegex.test(detailJson)).toBe(false);
+    expect(detailJson).not.toContain(VALID_CTX_HASH);
+    expect(detailJson).not.toContain("obs::");
+    expect(detailJson).not.toContain("listing_key");
+    expect(detailJson).not.toContain("fulfillment_context_id");
+    expect(detailJson).not.toContain("deduplication_key");
+
+    // Verify observations presentation IDs
+    expect(detail?.observations).toHaveLength(2);
+    expect(detail?.observations[0]?.presentationId).toBe("obs-1");
+    expect(detail?.observations[1]?.presentationId).toBe("obs-2");
+
+    // 2. Audit Client Component props: PriceHistoryChart input mapping
+    // In product detail page, observations are mapped to ChartPricePoint[]
+    const chartPricePoints = (detail?.observations ?? []).map((o) => ({
+      date: o.observedAt,
+      price: o.observedPriceCop,
+      referencePrice: o.declaredReferencePriceCop,
+      storeName: o.storeName,
+      availability: o.availability,
+    }));
+    const chartPropsJson = JSON.stringify({
+      points: chartPricePoints,
+      currency: "COP",
+      title: "Historial de precios",
+    });
+
+    expect(contextHashRegex.test(chartPropsJson)).toBe(false);
+    expect(chartPropsJson).not.toContain(VALID_CTX_HASH);
+    expect(chartPropsJson).not.toContain("obs::");
+    expect(chartPropsJson).not.toContain("listing");
+    expect(chartPropsJson).not.toContain("hash");
+
+    // 3. Audit fetchDashboardSummary
+    const summary = fetchDashboardSummary();
+    const summaryJson = JSON.stringify(summary);
+    expect(contextHashRegex.test(summaryJson)).toBe(false);
+    expect(summaryJson).not.toContain(VALID_CTX_HASH);
+    expect(summaryJson).not.toContain("obs::");
+    expect(summaryJson).not.toContain("deduplication_key");
+    expect(summaryJson).not.toContain("fulfillment_context_id");
+
+    // 4. Audit fetchActiveOpportunities
+    const opps = fetchActiveOpportunities();
+    const oppsJson = JSON.stringify(opps);
+    expect(contextHashRegex.test(oppsJson)).toBe(false);
+    expect(oppsJson).not.toContain(VALID_CTX_HASH);
+    expect(oppsJson).not.toContain("obs::");
+    expect(oppsJson).not.toContain("deduplication_key");
+    expect(oppsJson).not.toContain("fulfillment_context_id");
+  });
+
+  // 14. Scenario 14: Multi-variant navigation and URL disambiguation (F5-02 & F5-03)
+  it("Scenario 14: resolves multi-variant products cleanly and isolates active opportunities without cross-contamination", () => {
+    const writer = new SqlitePrivateHistoryRepository(dbPath);
+
+    const variantAKey = "rappi-authenticated-inspector::beverage-family::beverage-500ml";
+    const variantBKey = "rappi-authenticated-inspector::beverage-family::beverage-1500ml";
+
+    // Scan 1: Baseline for both variants
+    writer.persistApprovedInspectionBatch(
+      makeSupervisedBatchInput(
+        [
+          makeProvisionalListing({
+            externalProductId: "beverage-family",
+            externalVariantId: "beverage-500ml",
+            name: "Jugo Natural 500ml",
+            observedPriceCop: 4000,
+            sourceObservedAt: "2026-11-08T10:00:00.000Z",
+          }),
+          makeProvisionalListing({
+            externalProductId: "beverage-family",
+            externalVariantId: "beverage-1500ml",
+            name: "Jugo Natural 1.5L",
+            observedPriceCop: 9000,
+            sourceObservedAt: "2026-11-08T10:00:00.000Z",
+          }),
+        ],
+        { scanRunId: "scan-bev-1", observedAtIso: "2026-11-08T10:00:00.000Z" },
+      ),
+      { ownerConfirmed: true },
+    );
+
+    // Scan 2: Price drop on 500ml only (4000 -> 3000)
+    writer.persistApprovedInspectionBatch(
+      makeSupervisedBatchInput(
+        [
+          makeProvisionalListing({
+            externalProductId: "beverage-family",
+            externalVariantId: "beverage-500ml",
+            name: "Jugo Natural 500ml",
+            observedPriceCop: 3000,
+            declaredReferencePriceCop: 4000,
+            sourceObservedAt: "2026-11-09T10:00:00.000Z",
+          }),
+          makeProvisionalListing({
+            externalProductId: "beverage-family",
+            externalVariantId: "beverage-1500ml",
+            name: "Jugo Natural 1.5L",
+            observedPriceCop: 9000,
+            sourceObservedAt: "2026-11-09T10:00:00.000Z",
+          }),
+        ],
+        { scanRunId: "scan-bev-2", observedAtIso: "2026-11-09T10:00:00.000Z" },
+      ),
+      { ownerConfirmed: true },
+    );
+    writer.close();
+
+    // 1. Unambiguous productVariantKey queries resolve their respective variants
+    const { detail: detailA } = fetchProductDetail(variantAKey);
+    expect(detailA).toBeDefined();
+    expect(detailA?.product.productName).toBe("Jugo Natural 500ml");
+    expect(detailA?.statistics.currentPriceCop).toBe(3000);
+    expect(detailA?.activeOpportunities.length).toBeGreaterThanOrEqual(1);
+    expect(detailA?.activeOpportunities[0]?.discountPercentage).toBe(25);
+
+    const { detail: detailB } = fetchProductDetail(variantBKey);
+    expect(detailB).toBeDefined();
+    expect(detailB?.product.productName).toBe("Jugo Natural 1.5L");
+    expect(detailB?.statistics.currentPriceCop).toBe(9000);
+    expect(detailB?.activeOpportunities).toHaveLength(0);
+
+    // 2. Ambiguous bare externalProductId query with multiple variants returns null
+    const { detail: ambiguousDetail } = fetchProductDetail("beverage-family");
+    expect(ambiguousDetail).toBeNull();
+  });
 });

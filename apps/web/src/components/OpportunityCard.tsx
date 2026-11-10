@@ -1,10 +1,10 @@
 import Link from "next/link";
 import { formatCop } from "@priceradar/domain";
-import type { PersistedOpportunityEventRow } from "@priceradar/database";
+import type { DashboardOpportunityItem } from "@priceradar/database";
 import { PriceBadge } from "./PriceBadge";
 
 export interface OpportunityCardProps {
-  readonly opportunity: PersistedOpportunityEventRow;
+  readonly opportunity: DashboardOpportunityItem;
 }
 
 export function OpportunityCard({ opportunity }: OpportunityCardProps) {
@@ -19,6 +19,7 @@ export function OpportunityCard({ opportunity }: OpportunityCardProps) {
       : "var(--border)";
 
   const formattedDate = new Date(opportunity.detectedAt).toLocaleDateString("es-CO", {
+    timeZone: "America/Bogota",
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -57,7 +58,7 @@ export function OpportunityCard({ opportunity }: OpportunityCardProps) {
         </div>
 
         <Link
-          href={`/products/${encodeURIComponent(opportunity.externalProductId)}`}
+          href={`/products/${encodeURIComponent(opportunity.productVariantKey)}`}
           style={{
             textDecoration: "none",
             color: "inherit",

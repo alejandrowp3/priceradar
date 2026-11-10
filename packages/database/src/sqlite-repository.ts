@@ -936,6 +936,10 @@ export function computeScanBatchFingerprint(
 /**
  * Local private SQLite storage repository (`Phase P2`) backed by Node.js built-in `node:sqlite`.
  */
+function createPresentationOpportunityId(rawOpportunityId: string): string {
+  return `opp-${crypto.createHash("sha256").update(rawOpportunityId).digest("hex").slice(0, 16)}`;
+}
+
 export class SqlitePrivateHistoryRepository {
   private readonly dbPath: string;
   private readonly db: DatabaseSync;
@@ -3309,7 +3313,10 @@ export class SqlitePrivateHistoryRepository {
       }
     }
 
-    const topOpportunities = this.listDetectedOpportunities({ limit: 6 });
+    const topOpportunities = this.listActiveOpportunities({
+      pageSize: 6,
+      sortBy: "DISCOUNT_DESC",
+    }).items;
     const recentlyObservedProducts = this.listCatalogProducts({
       pageSize: 6,
       sortBy: "LAST_SEEN_DESC",
@@ -3621,7 +3628,7 @@ export class SqlitePrivateHistoryRepository {
         r.opp_conf !== null
           ? {
               activeOpportunity: {
-                opportunityId: r.opp_id,
+                opportunityId: createPresentationOpportunityId(r.opp_id),
                 type: r.opp_type,
                 labelEsCo: r.opp_label,
                 savingsCop: createCopAmount(r.opp_savings),
@@ -3649,7 +3656,8 @@ export class SqlitePrivateHistoryRepository {
     const trimmed = productIdOrKey.trim();
     if (!trimmed) return undefined;
 
-    const productRow = this.db
+    // Check if trimmed matches an exact product_variant_key first
+    let productRow = this.db
       .prepare(
         `SELECT
           p.product_variant_key,
@@ -3669,11 +3677,11 @@ export class SqlitePrivateHistoryRepository {
         FROM products p
         LEFT JOIN price_observations o ON o.product_variant_key = p.product_variant_key AND o.is_superseded = 0
         LEFT JOIN stores s ON s.store_key = o.store_key
-        WHERE p.external_product_id = ? OR p.product_variant_key = ?
+        WHERE p.product_variant_key = ?
         ORDER BY o.observed_at DESC
         LIMIT 1`,
       )
-      .get(trimmed, trimmed) as
+      .get(trimmed) as
       | {
           product_variant_key: string;
           external_product_id: string;
@@ -3692,6 +3700,47 @@ export class SqlitePrivateHistoryRepository {
         }
       | undefined;
 
+    // If not found by product_variant_key, check if it's an external_product_id
+    if (!productRow) {
+      const matchingKeys = this.db
+        .prepare(`SELECT product_variant_key FROM products WHERE external_product_id = ?`)
+        .all(trimmed) as Array<{ product_variant_key: string }>;
+
+      // If exactly 1 variant exists, resolve safely (preserves legacy single-variant lookup)
+      if (matchingKeys.length === 1 && matchingKeys[0]) {
+        const singleKey = matchingKeys[0].product_variant_key;
+        productRow = this.db
+          .prepare(
+            `SELECT
+              p.product_variant_key,
+              p.external_product_id,
+              p.external_variant_id,
+              p.product_name,
+              p.brand,
+              p.packaging_label,
+              p.unit_quantity,
+              p.unit_type,
+              p.category_slug,
+              p.canonical_product_url,
+              p.first_seen_at,
+              p.last_seen_at,
+              COALESCE(s.store_name, 'Desconocida') as store_name,
+              COALESCE(s.external_store_id, 'N/A') as external_store_id
+            FROM products p
+            LEFT JOIN price_observations o ON o.product_variant_key = p.product_variant_key AND o.is_superseded = 0
+            LEFT JOIN stores s ON s.store_key = o.store_key
+            WHERE p.product_variant_key = ?
+            ORDER BY o.observed_at DESC
+            LIMIT 1`,
+          )
+          .get(singleKey) as typeof productRow;
+      } else {
+        // If matchingKeys.length > 1, the externalProductId is ambiguous across variants!
+        // Returning undefined prevents silently selecting an incorrect variant.
+        return undefined;
+      }
+    }
+
     if (!productRow) {
       return undefined;
     }
@@ -3699,14 +3748,10 @@ export class SqlitePrivateHistoryRepository {
     const obsRows = this.db
       .prepare(
         `SELECT
-          o.observation_id,
           o.observed_at,
           o.observed_price_cop,
           o.declared_reference_price_cop,
           o.availability,
-          o.provenance,
-          o.geographic_verification_verdict,
-          o.address_specific_pricing_verified,
           s.store_name,
           r.source_view_key,
           r.source_view_label
@@ -3717,30 +3762,23 @@ export class SqlitePrivateHistoryRepository {
         ORDER BY o.observed_at ASC, o.observation_id ASC`,
       )
       .all(productRow.product_variant_key) as Array<{
-      observation_id: string;
       observed_at: string;
       observed_price_cop: number;
       declared_reference_price_cop: number | null;
       availability: string;
-      provenance: string;
-      geographic_verification_verdict: string;
-      address_specific_pricing_verified: number;
       store_name: string;
       source_view_key: string | null;
       source_view_label: string | null;
     }>;
 
-    const observations = obsRows.map((r) => ({
-      observationId: r.observation_id,
+    const observations: ProductDetailObservationItem[] = obsRows.map((r, idx) => ({
+      presentationId: `obs-${idx + 1}`,
       observedAt: r.observed_at,
       observedPriceCop: createCopAmount(r.observed_price_cop),
       ...(r.declared_reference_price_cop !== null
         ? { declaredReferencePriceCop: createCopAmount(r.declared_reference_price_cop) }
         : {}),
       availability: r.availability,
-      provenance: r.provenance,
-      geographicVerificationVerdict: r.geographic_verification_verdict,
-      addressSpecificPricingVerified: r.address_specific_pricing_verified === 1,
       storeName: r.store_name,
       ...(r.source_view_key !== null ? { sourceViewKey: r.source_view_key } : {}),
       ...(r.source_view_label !== null ? { sourceViewLabel: r.source_view_label } : {}),
@@ -3783,10 +3821,74 @@ export class SqlitePrivateHistoryRepository {
     const firstObservedAt = observations[0]?.observedAt ?? productRow.first_seen_at;
     const lastObservedAt = latestOb?.observedAt ?? productRow.last_seen_at;
 
-    const activeOpportunities = this.listDetectedOpportunities({
-      lifecycleStatus: "ACTIVE",
-      limit: 50,
-    }).filter((opp) => opp.externalProductId === productRow.external_product_id);
+    const oppRows = this.db
+      .prepare(
+        `SELECT
+          e.opportunity_id,
+          e.product_variant_key,
+          p.external_product_id,
+          p.external_variant_id,
+          p.product_name,
+          p.brand,
+          p.packaging_label,
+          s.store_name,
+          e.opportunity_type,
+          e.label_es_co,
+          e.baseline_price_cop,
+          e.previous_price_cop,
+          e.observed_price_cop,
+          e.savings_cop,
+          e.discount_percentage,
+          e.confidence,
+          e.detected_at
+        FROM opportunity_events e
+        JOIN products p ON p.product_variant_key = e.product_variant_key
+        JOIN stores s ON s.store_key = e.store_key
+        WHERE e.product_variant_key = ?
+          AND e.lifecycle_status = 'ACTIVE'
+        ORDER BY e.detected_at DESC`,
+      )
+      .all(productRow.product_variant_key) as Array<{
+      opportunity_id: string;
+      product_variant_key: string;
+      external_product_id: string;
+      external_variant_id: string;
+      product_name: string;
+      brand: string | null;
+      packaging_label: string;
+      store_name: string;
+      opportunity_type: OpportunityType;
+      label_es_co: string;
+      baseline_price_cop: number;
+      previous_price_cop: number | null;
+      observed_price_cop: number;
+      savings_cop: number;
+      discount_percentage: number;
+      confidence: ConfidenceLevel;
+      detected_at: string;
+    }>;
+
+    const activeOpportunities: DashboardOpportunityItem[] = oppRows.map((r) => ({
+      opportunityId: createPresentationOpportunityId(r.opportunity_id),
+      productVariantKey: r.product_variant_key,
+      externalProductId: r.external_product_id,
+      externalVariantId: r.external_variant_id,
+      productName: r.product_name,
+      ...(r.brand !== null ? { brand: r.brand } : {}),
+      packagingLabel: r.packaging_label,
+      storeName: r.store_name,
+      opportunityType: r.opportunity_type,
+      labelEsCo: r.label_es_co,
+      baselinePriceCop: createCopAmount(r.baseline_price_cop),
+      ...(r.previous_price_cop !== null
+        ? { previousPriceCop: createCopAmount(r.previous_price_cop) }
+        : {}),
+      observedPriceCop: createCopAmount(r.observed_price_cop),
+      savingsCop: createCopAmount(r.savings_cop),
+      discountPercentage: r.discount_percentage,
+      confidence: r.confidence,
+      detectedAt: r.detected_at,
+    }));
 
     return {
       product: {
@@ -3830,7 +3932,7 @@ export class SqlitePrivateHistoryRepository {
    */
   public listActiveOpportunities(
     options?: ListActiveOpportunitiesOptions,
-  ): PaginatedResult<PersistedOpportunityEventRow> {
+  ): PaginatedResult<DashboardOpportunityItem> {
     const page = Math.max(1, options?.page ?? 1);
     const pageSize = Math.min(100, Math.max(1, options?.pageSize ?? 20));
     const offset = (page - 1) * pageSize;
@@ -3903,37 +4005,22 @@ export class SqlitePrivateHistoryRepository {
     const selectSql = `
       SELECT
         e.opportunity_id,
-        e.deduplication_key,
-        e.listing_key,
-        e.observation_id,
-        e.scan_run_id,
-        s.external_store_id,
-        s.store_name,
+        e.product_variant_key,
         p.external_product_id,
         p.external_variant_id,
         p.product_name,
+        p.brand,
         p.packaging_label,
-        e.fulfillment_context_id,
+        s.store_name,
         e.opportunity_type,
         e.label_es_co,
         e.baseline_price_cop,
         e.previous_price_cop,
         e.observed_price_cop,
         e.savings_cop,
-        e.discount_basis_points,
         e.discount_percentage,
-        e.historical_observation_count,
-        e.historical_low_cop,
-        e.historical_median_cop,
         e.confidence,
-        e.requires_verification,
-        e.provenance,
-        e.geographic_verification_verdict,
-        e.rationale_es_co,
-        e.detected_at,
-        e.lifecycle_status,
-        e.event_origin,
-        e.reevaluation_run_id
+        e.detected_at
       FROM opportunity_events e
       JOIN products p ON p.product_variant_key = e.product_variant_key
       JOIN stores s ON s.store_key = e.store_key
@@ -3946,52 +4033,33 @@ export class SqlitePrivateHistoryRepository {
       .prepare(selectSql)
       .all(...whereParams, pageSize, offset) as Array<{
       opportunity_id: string;
-      deduplication_key: string;
-      listing_key: string;
-      observation_id: string;
-      scan_run_id: string;
-      external_store_id: string;
-      store_name: string;
+      product_variant_key: string;
       external_product_id: string;
       external_variant_id: string;
       product_name: string;
+      brand: string | null;
       packaging_label: string;
-      fulfillment_context_id: string;
+      store_name: string;
       opportunity_type: OpportunityType;
       label_es_co: string;
       baseline_price_cop: number;
       previous_price_cop: number | null;
       observed_price_cop: number;
       savings_cop: number;
-      discount_basis_points: number;
       discount_percentage: number;
-      historical_observation_count: number;
-      historical_low_cop: number;
-      historical_median_cop: number;
       confidence: ConfidenceLevel;
-      requires_verification: number;
-      provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
-      geographic_verification_verdict: GeographicVerificationVerdictType;
-      rationale_es_co: string;
       detected_at: string;
-      lifecycle_status: OpportunityLifecycleStatus;
-      event_origin: OpportunityEventOrigin;
-      reevaluation_run_id: string | null;
     }>;
 
-    const items: PersistedOpportunityEventRow[] = rows.map((r) => ({
-      opportunityId: r.opportunity_id,
-      deduplicationKey: r.deduplication_key,
-      listingKey: r.listing_key,
-      observationId: r.observation_id,
-      scanRunId: r.scan_run_id,
-      externalStoreId: r.external_store_id,
-      storeName: r.store_name,
+    const items: DashboardOpportunityItem[] = rows.map((r) => ({
+      opportunityId: createPresentationOpportunityId(r.opportunity_id),
+      productVariantKey: r.product_variant_key,
       externalProductId: r.external_product_id,
       externalVariantId: r.external_variant_id,
       productName: r.product_name,
+      ...(r.brand !== null ? { brand: r.brand } : {}),
       packagingLabel: r.packaging_label,
-      fulfillmentContextId: r.fulfillment_context_id,
+      storeName: r.store_name,
       opportunityType: r.opportunity_type,
       labelEsCo: r.label_es_co,
       baselinePriceCop: createCopAmount(r.baseline_price_cop),
@@ -4000,22 +4068,9 @@ export class SqlitePrivateHistoryRepository {
         : {}),
       observedPriceCop: createCopAmount(r.observed_price_cop),
       savingsCop: createCopAmount(r.savings_cop),
-      discountBasisPoints: r.discount_basis_points,
       discountPercentage: r.discount_percentage,
-      historicalObservationCount: r.historical_observation_count,
-      historicalLowCop: createCopAmount(r.historical_low_cop),
-      historicalMedianCop: createCopAmount(r.historical_median_cop),
       confidence: r.confidence,
-      requiresVerification: r.requires_verification === 1,
-      provenance: r.provenance,
-      geographicVerificationVerdict: r.geographic_verification_verdict,
-      rationaleEsCo: r.rationale_es_co,
       detectedAt: r.detected_at,
-      lifecycleStatus: r.lifecycle_status,
-      eventOrigin: r.event_origin,
-      ...(r.reevaluation_run_id !== null
-        ? { reevaluationRunId: r.reevaluation_run_id }
-        : {}),
     }));
 
     return {
@@ -4026,6 +4081,37 @@ export class SqlitePrivateHistoryRepository {
       totalPages,
     };
   }
+}
+
+export interface DashboardOpportunityItem {
+  readonly opportunityId: string;
+  readonly productVariantKey: string;
+  readonly externalProductId: string;
+  readonly externalVariantId: string;
+  readonly productName: string;
+  readonly brand?: string;
+  readonly packagingLabel: string;
+  readonly storeName: string;
+  readonly opportunityType: OpportunityType;
+  readonly labelEsCo: string;
+  readonly baselinePriceCop: CopAmount;
+  readonly previousPriceCop?: CopAmount;
+  readonly observedPriceCop: CopAmount;
+  readonly savingsCop: CopAmount;
+  readonly discountPercentage: number;
+  readonly confidence: ConfidenceLevel;
+  readonly detectedAt: string;
+}
+
+export interface ProductDetailObservationItem {
+  readonly presentationId: string;
+  readonly observedAt: string;
+  readonly observedPriceCop: CopAmount;
+  readonly declaredReferencePriceCop?: CopAmount;
+  readonly availability: string;
+  readonly storeName: string;
+  readonly sourceViewKey?: string;
+  readonly sourceViewLabel?: string;
 }
 
 export interface DashboardSummary {
@@ -4045,7 +4131,7 @@ export interface DashboardSummary {
     readonly sourceViewLabel?: string;
     readonly newProductsDiscovered: number;
   };
-  readonly topOpportunities: readonly PersistedOpportunityEventRow[];
+  readonly topOpportunities: readonly DashboardOpportunityItem[];
   readonly recentlyObservedProducts: readonly CatalogProductSummaryItem[];
   readonly freshnessStatus: "RECENT" | "MODERATE" | "STALE" | "EMPTY";
 }
@@ -4135,20 +4221,8 @@ export interface ProductDetailView {
     readonly lastObservedAt: string;
     readonly hasSufficientHistory: boolean;
   };
-  readonly observations: ReadonlyArray<{
-    readonly observationId: string;
-    readonly observedAt: string;
-    readonly observedPriceCop: CopAmount;
-    readonly declaredReferencePriceCop?: CopAmount;
-    readonly availability: string;
-    readonly provenance: string;
-    readonly geographicVerificationVerdict: string;
-    readonly addressSpecificPricingVerified: boolean;
-    readonly storeName: string;
-    readonly sourceViewKey?: string;
-    readonly sourceViewLabel?: string;
-  }>;
-  readonly activeOpportunities: readonly PersistedOpportunityEventRow[];
+  readonly observations: readonly ProductDetailObservationItem[];
+  readonly activeOpportunities: readonly DashboardOpportunityItem[];
 }
 
 export interface ListActiveOpportunitiesOptions {

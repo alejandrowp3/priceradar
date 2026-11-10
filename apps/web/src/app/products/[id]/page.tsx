@@ -33,11 +33,13 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
   const { product, statistics, observations, activeOpportunities } = detail;
 
   const firstSeenStr = new Date(statistics.firstObservedAt).toLocaleDateString("es-CO", {
+    timeZone: "America/Bogota",
     month: "short",
     day: "numeric",
     year: "numeric",
   });
   const lastSeenStr = new Date(statistics.lastObservedAt).toLocaleString("es-CO", {
+    timeZone: "America/Bogota",
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -263,7 +265,17 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
           Curva Histórica de Precios
         </h2>
         <PriceHistoryChart
-          observations={observations}
+          observations={observations.map((obs, idx) => ({
+            pointIndex: idx,
+            observedAt: obs.observedAt,
+            observedPriceCop: obs.observedPriceCop,
+            ...(obs.declaredReferencePriceCop !== undefined
+              ? { declaredReferencePriceCop: obs.declaredReferencePriceCop }
+              : {}),
+            ...(obs.sourceViewLabel !== undefined
+              ? { sourceViewLabel: obs.sourceViewLabel }
+              : {}),
+          }))}
           productName={product.productName}
         />
       </section>
@@ -322,17 +334,22 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
             <tbody>
               {observations.map((obs, idx) => {
                 const dateStr = new Date(obs.observedAt).toLocaleString("es-CO", {
+                  timeZone: "America/Bogota",
                   month: "short",
                   day: "numeric",
                   year: "numeric",
                   hour: "2-digit",
                   minute: "2-digit",
                 });
-                const isAvailable =
-                  obs.availability === "AVAILABLE" || obs.availability === "IN_STOCK";
+                const availabilityState =
+                  obs.availability === "AVAILABLE" || obs.availability === "IN_STOCK"
+                    ? { label: "Disponible", color: "var(--accent-emerald)" }
+                    : obs.availability === "OUT_OF_STOCK"
+                      ? { label: "Agotado", color: "var(--accent-rose)" }
+                      : { label: "No especificado", color: "var(--accent-amber)" };
                 return (
                   <tr
-                    key={obs.observationId}
+                    key={obs.presentationId}
                     style={{
                       borderBottom:
                         idx < observations.length - 1
@@ -371,13 +388,11 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
                           width: "8px",
                           height: "8px",
                           borderRadius: "50%",
-                          backgroundColor: isAvailable
-                            ? "var(--accent-emerald)"
-                            : "var(--accent-rose)",
+                          backgroundColor: availabilityState.color,
                           marginRight: "0.35rem",
                         }}
                       />
-                      {isAvailable ? "Disponible" : "Agotado"}
+                      {availabilityState.label}
                     </td>
                   </tr>
                 );

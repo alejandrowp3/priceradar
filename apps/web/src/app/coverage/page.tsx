@@ -149,6 +149,7 @@ export default function CoveragePage() {
               {report.views.map((row, idx) => {
                 const isLegacy = row.viewKey === "VISTA_DEFAULT";
                 const lastDate = new Date(row.lastObservedAt).toLocaleString("es-CO", {
+                  timeZone: "America/Bogota",
                   month: "short",
                   day: "numeric",
                   hour: "2-digit",

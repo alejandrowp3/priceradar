@@ -9,6 +9,7 @@ export interface ProductCardProps {
 
 export function ProductCard({ product }: ProductCardProps) {
   const formattedDate = new Date(product.lastObservedAt).toLocaleDateString("es-CO", {
+    timeZone: "America/Bogota",
     month: "short",
     day: "numeric",
   });
@@ -66,7 +67,7 @@ export function ProductCard({ product }: ProductCardProps) {
         </div>
 
         <Link
-          href={`/products/${encodeURIComponent(product.externalProductId)}`}
+          href={`/products/${encodeURIComponent(product.productVariantKey)}`}
           style={{
             textDecoration: "none",
             color: "inherit",

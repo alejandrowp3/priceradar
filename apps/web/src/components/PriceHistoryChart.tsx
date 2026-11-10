@@ -4,16 +4,16 @@ import { useState } from "react";
 import { formatCop, createCopAmount } from "@priceradar/domain";
 import type { CopAmount } from "@priceradar/domain";
 
-export interface TimelineObservation {
-  readonly observationId: string;
+export interface ChartPricePoint {
+  readonly pointIndex: number;
   readonly observedAt: string;
   readonly observedPriceCop: CopAmount;
   readonly declaredReferencePriceCop?: CopAmount;
-  readonly sourceViewKey?: string;
+  readonly sourceViewLabel?: string;
 }
 
 export interface PriceHistoryChartProps {
-  readonly observations: readonly TimelineObservation[];
+  readonly observations: readonly ChartPricePoint[];
   readonly productName: string;
 }
 
@@ -43,6 +43,11 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
     if (!obs) {
       return null;
     }
+    const singleObsDate = new Date(obs.observedAt).toLocaleString("es-CO", {
+      timeZone: "America/Bogota",
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
     return (
       <div
         style={{
@@ -69,7 +74,7 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
           observación en un momento diferente).
         </p>
         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-          Observado el {new Date(obs.observedAt).toLocaleString("es-CO")}
+          Observado el {singleObsDate} (Colombia)
         </span>
       </div>
     );
@@ -102,11 +107,24 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
   const yMax = Math.ceil(maxPrice + yPadding);
   const yRange = yMax - yMin || 1;
 
+  // Time-proportional calculation on X-axis (Minor correction 1)
+  const firstObs = sorted[0];
+  const lastObs = sorted[sorted.length - 1];
+  const firstTime = firstObs ? new Date(firstObs.observedAt).getTime() : 0;
+  const lastTime = lastObs ? new Date(lastObs.observedAt).getTime() : 0;
+  const timeSpan = lastTime - firstTime;
+
   // Calculate coordinates for points
   const points = sorted.map((obs, idx) => {
-    const x =
-      paddingLeft +
-      (sorted.length > 1 ? (idx / (sorted.length - 1)) * chartWidth : chartWidth / 2);
+    let x: number;
+    if (timeSpan > 0) {
+      const timeRatio = (new Date(obs.observedAt).getTime() - firstTime) / timeSpan;
+      x = paddingLeft + timeRatio * chartWidth;
+    } else {
+      x =
+        paddingLeft +
+        (sorted.length > 1 ? (idx / (sorted.length - 1)) * chartWidth : chartWidth / 2);
+    }
     const normalizedY = ((obs.observedPriceCop as number) - yMin) / yRange;
     const y = paddingTop + chartHeight - normalizedY * chartHeight;
     return { x, y, obs, idx };
@@ -146,10 +164,10 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
           overflow: "visible",
         }}
         role="img"
-        aria-label={`Historial de precios para ${productName}`}
+        aria-label={`Historial proporcional de precios para ${productName}`}
       >
         <title>{`Historial de precios para ${productName}`}</title>
-        <desc>{`Gráfico de línea con ${observations.length} observaciones de precio entre ${formatCop(createCopAmount(minPrice))} y ${formatCop(createCopAmount(maxPrice))}`}</desc>
+        <desc>{`Gráfico de línea proporcional en el tiempo (America/Bogota) con ${observations.length} observaciones entre ${formatCop(createCopAmount(minPrice))} y ${formatCop(createCopAmount(maxPrice))}`}</desc>
 
         {/* Horizontal grid lines */}
         {yTicks.map((tick, i) => (
@@ -192,6 +210,15 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
         {/* Data points */}
         {points.map((pt) => {
           const isSelected = activePointIndex === pt.idx;
+          const formattedObsDate = new Date(pt.obs.observedAt).toLocaleDateString(
+            "es-CO",
+            {
+              timeZone: "America/Bogota",
+              month: "short",
+              day: "numeric",
+            },
+          );
+
           return (
             <g key={pt.idx}>
               <circle
@@ -208,7 +235,7 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
                 onBlur={() => setActivePointIndex(null)}
                 tabIndex={0}
                 role="button"
-                aria-label={`Observación ${pt.idx + 1}: ${formatCop(pt.obs.observedPriceCop)} el ${new Date(pt.obs.observedAt).toLocaleDateString("es-CO")}`}
+                aria-label={`Observación ${pt.idx + 1}: ${formatCop(pt.obs.observedPriceCop)} el ${formattedObsDate}`}
               />
 
               {/* X-axis date labels for first and last, or intermediate if spaced */}
@@ -220,16 +247,29 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
                   fill="var(--text-muted)"
                   fontSize="10"
                 >
-                  {new Date(pt.obs.observedAt).toLocaleDateString("es-CO", {
-                    month: "short",
-                    day: "numeric",
-                  })}
+                  {formattedObsDate}
                 </text>
               )}
             </g>
           );
         })}
       </svg>
+
+      {/* Caption indicating proportional timeline */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          fontSize: "0.75rem",
+          color: "var(--text-muted)",
+          marginTop: "0.25rem",
+          padding: "0 0.25rem",
+        }}
+      >
+        <span>Eje temporal proporcional (hora legal de Colombia • America/Bogota)</span>
+        <span>{observations.length} observaciones registradas</span>
+      </div>
 
       {/* Active point tooltip card */}
       {activePoint && (
@@ -264,13 +304,14 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
           )}
           <div style={{ color: "var(--text-secondary)", marginTop: "0.25rem" }}>
             {new Date(activePoint.obs.observedAt).toLocaleString("es-CO", {
+              timeZone: "America/Bogota",
               month: "short",
               day: "numeric",
               hour: "2-digit",
               minute: "2-digit",
             })}
           </div>
-          {activePoint.obs.sourceViewKey && (
+          {activePoint.obs.sourceViewLabel && (
             <div
               style={{
                 color: "var(--accent-signal)",
@@ -278,7 +319,7 @@ export function PriceHistoryChart({ observations, productName }: PriceHistoryCha
                 marginTop: "0.15rem",
               }}
             >
-              Vista: {activePoint.obs.sourceViewKey}
+              Pasillo: {activePoint.obs.sourceViewLabel}
             </div>
           )}
         </div>
