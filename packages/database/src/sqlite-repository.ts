@@ -936,20 +936,41 @@ export function computeScanBatchFingerprint(
 /**
  * Local private SQLite storage repository (`Phase P2`) backed by Node.js built-in `node:sqlite`.
  */
+function createPresentationOpportunityId(rawOpportunityId: string): string {
+  return `opp-${crypto.createHash("sha256").update(rawOpportunityId).digest("hex").slice(0, 16)}`;
+}
+
 export class SqlitePrivateHistoryRepository {
   private readonly dbPath: string;
   private readonly db: DatabaseSync;
+  private readonly isReadOnly: boolean;
   private isClosed = false;
 
   public constructor(
     dbPath: string = DEFAULT_PRIVATE_SQLITE_DB_PATH,
     options?: {
+      /** Opens the database connection in read-only mode (PRAGMA query_only = ON; zero file writes/migrations). */
+      readonly readOnly?: boolean;
       /** Test-only fault injection to verify atomic rollback of the v2 migration. */
       readonly simulateMigrationFailureAfterV2Step?: "ADD_COLUMNS";
     },
   ) {
     assertDatabasePathOutsideRepository(dbPath);
     this.dbPath = dbPath === ":memory:" ? ":memory:" : path.resolve(dbPath);
+    this.isReadOnly = Boolean(options?.readOnly);
+
+    if (this.isReadOnly) {
+      if (this.dbPath !== ":memory:" && !fs.existsSync(this.dbPath)) {
+        throw new Error(
+          `Cannot open read-only database: file does not exist at '${this.dbPath}'.`,
+        );
+      }
+      this.db = new DatabaseSync(this.dbPath, { readOnly: true });
+      this.db.exec("PRAGMA query_only = ON;");
+      this.db.exec("PRAGMA foreign_keys = ON;");
+      this.db.exec("PRAGMA busy_timeout = 5000;");
+      return;
+    }
 
     if (this.dbPath !== ":memory:") {
       const dir = path.dirname(this.dbPath);
@@ -970,6 +991,18 @@ export class SqlitePrivateHistoryRepository {
       throw err;
     }
     enforcePrivateDatabaseFilePermissions(this.dbPath);
+  }
+
+  public getIsReadOnly(): boolean {
+    return this.isReadOnly;
+  }
+
+  private assertWritable(operation: string): void {
+    if (this.isReadOnly) {
+      throw new Error(
+        `Cannot perform '${operation}' on a read-only database repository connection.`,
+      );
+    }
   }
 
   public getDatabasePath(): string {
@@ -1118,6 +1151,7 @@ export class SqlitePrivateHistoryRepository {
   }
 
   public withImmediateTransaction<T>(fn: () => T): T {
+    this.assertWritable("withImmediateTransaction");
     this.db.exec("BEGIN IMMEDIATE;");
     try {
       const result = fn();
@@ -1487,6 +1521,8 @@ export class SqlitePrivateHistoryRepository {
         opportunitiesInserted: 0,
       };
     }
+
+    this.assertWritable("persistApprovedInspectionBatch");
 
     const eligibility = evaluateBatchPersistenceEligibility(context);
     if (
@@ -2177,6 +2213,7 @@ export class SqlitePrivateHistoryRepository {
     readonly evaluationTimeIso?: string;
     readonly reevaluationRunId?: string;
   }): ReevaluateLatestOpportunitiesResult {
+    this.assertWritable("reevaluateLatestListingOpportunities");
     const intelligenceConfig =
       options?.intelligenceConfig ?? PRIVATE_HISTORY_INTELLIGENCE_CONFIG;
     const evaluationTimeIso = options?.evaluationTimeIso ?? new Date().toISOString();
@@ -3208,4 +3245,996 @@ export class SqlitePrivateHistoryRepository {
         : {}),
     }));
   }
+
+  /**
+   * Returns a top-level telemetry summary for the dashboard overview (`P4`).
+   */
+  public getDashboardSummary(): DashboardSummary {
+    const totalDistinctProductsRow = this.db
+      .prepare("SELECT COUNT(DISTINCT external_product_id) as c FROM products")
+      .get() as { c: number } | undefined;
+    const totalActiveObsRow = this.db
+      .prepare("SELECT COUNT(*) as c FROM price_observations WHERE is_superseded = 0")
+      .get() as { c: number } | undefined;
+    const activeOppsRow = this.db
+      .prepare(
+        "SELECT COUNT(*) as c FROM opportunity_events WHERE lifecycle_status = 'ACTIVE'",
+      )
+      .get() as { c: number } | undefined;
+    const historicalLowsRow = this.db
+      .prepare(
+        "SELECT COUNT(*) as c FROM opportunity_events WHERE lifecycle_status = 'ACTIVE' AND opportunity_type = 'HISTORICAL_LOW'",
+      )
+      .get() as { c: number } | undefined;
+    const totalScanRunsRow = this.db
+      .prepare("SELECT COUNT(*) as c FROM scan_runs WHERE status = 'SUCCEEDED'")
+      .get() as { c: number } | undefined;
+    const totalInspectedViewsRow = this.db
+      .prepare(
+        "SELECT COUNT(DISTINCT COALESCE(source_view_key, 'VISTA_DEFAULT')) as c FROM scan_runs WHERE status = 'SUCCEEDED'",
+      )
+      .get() as { c: number } | undefined;
+    const latestObsRow = this.db
+      .prepare(
+        "SELECT MAX(observed_at) as m FROM price_observations WHERE is_superseded = 0",
+      )
+      .get() as { m: string | null } | undefined;
+    const latestScanRunRow = this.db
+      .prepare(
+        `SELECT scan_run_id, started_at, source_view_key, source_view_label, new_products_discovered
+         FROM scan_runs
+         WHERE status = 'SUCCEEDED'
+         ORDER BY started_at DESC, scan_run_id DESC
+         LIMIT 1`,
+      )
+      .get() as
+      | {
+          scan_run_id: string;
+          started_at: string;
+          source_view_key: string | null;
+          source_view_label: string | null;
+          new_products_discovered: number | null;
+        }
+      | undefined;
+
+    const totalActiveObs = Number(totalActiveObsRow?.c ?? 0);
+    const latestObservationAt = latestObsRow?.m ?? undefined;
+
+    let freshnessStatus: "RECENT" | "MODERATE" | "STALE" | "EMPTY" = "EMPTY";
+    if (totalActiveObs > 0 && latestObservationAt) {
+      const ageMs = Date.now() - new Date(latestObservationAt).getTime();
+      const ageHours = ageMs / (1000 * 60 * 60);
+      if (ageHours <= 24) {
+        freshnessStatus = "RECENT";
+      } else if (ageHours <= 168) {
+        freshnessStatus = "MODERATE";
+      } else {
+        freshnessStatus = "STALE";
+      }
+    }
+
+    const topOpportunities = this.listActiveOpportunities({
+      pageSize: 6,
+      sortBy: "DISCOUNT_DESC",
+    }).items;
+    const recentlyObservedProducts = this.listCatalogProducts({
+      pageSize: 6,
+      sortBy: "LAST_SEEN_DESC",
+    }).items;
+
+    return {
+      counts: {
+        totalDistinctProducts: Number(totalDistinctProductsRow?.c ?? 0),
+        totalActiveObservations: totalActiveObs,
+        activeOpportunitiesCount: Number(activeOppsRow?.c ?? 0),
+        historicalLowsCount: Number(historicalLowsRow?.c ?? 0),
+        totalScanRuns: Number(totalScanRunsRow?.c ?? 0),
+        totalInspectedViews: Number(totalInspectedViewsRow?.c ?? 0),
+      },
+      ...(latestObservationAt !== undefined ? { latestObservationAt } : {}),
+      ...(latestScanRunRow !== undefined
+        ? {
+            latestScanRun: {
+              scanRunId: latestScanRunRow.scan_run_id,
+              startedAt: latestScanRunRow.started_at,
+              ...(latestScanRunRow.source_view_key !== null
+                ? { sourceViewKey: latestScanRunRow.source_view_key }
+                : {}),
+              ...(latestScanRunRow.source_view_label !== null
+                ? { sourceViewLabel: latestScanRunRow.source_view_label }
+                : {}),
+              newProductsDiscovered: latestScanRunRow.new_products_discovered ?? 0,
+            },
+          }
+        : {}),
+      topOpportunities,
+      recentlyObservedProducts,
+      freshnessStatus,
+    };
+  }
+
+  /**
+   * Returns a paginated, filterable catalog of products with latest price telemetry (`P4`).
+   */
+  public listCatalogProducts(
+    options?: ListCatalogProductsOptions,
+  ): PaginatedResult<CatalogProductSummaryItem> {
+    const page = Math.max(1, options?.page ?? 1);
+    const pageSize = Math.min(100, Math.max(1, options?.pageSize ?? 20));
+    const offset = (page - 1) * pageSize;
+
+    const whereClauses: string[] = ["latest.rn = 1"];
+    const whereParams: Array<string | number> = [];
+
+    const search = (options?.search ?? "").trim();
+    if (search) {
+      whereClauses.push(
+        "(p.product_name LIKE ? OR p.external_product_id = ? OR p.brand LIKE ?)",
+      );
+      const pattern = `%${search}%`;
+      whereParams.push(pattern, search, pattern);
+    }
+
+    if (options?.sourceViewKey) {
+      if (options.sourceViewKey === "VISTA_DEFAULT") {
+        whereClauses.push(
+          "EXISTS (SELECT 1 FROM scan_run_products srp JOIN scan_runs sr ON sr.scan_run_id = srp.scan_run_id WHERE srp.product_variant_key = p.product_variant_key AND (sr.source_view_key IS NULL OR sr.source_view_key = 'VISTA_DEFAULT'))",
+        );
+      } else {
+        whereClauses.push(
+          "EXISTS (SELECT 1 FROM scan_run_products srp JOIN scan_runs sr ON sr.scan_run_id = srp.scan_run_id WHERE srp.product_variant_key = p.product_variant_key AND sr.source_view_key = ?)",
+        );
+        whereParams.push(options.sourceViewKey);
+      }
+    }
+
+    if (options?.priceChange) {
+      switch (options.priceChange) {
+        case "DROPPED":
+          whereClauses.push("latest.observed_price_cop < prev.observed_price_cop");
+          break;
+        case "INCREASED":
+          whereClauses.push("latest.observed_price_cop > prev.observed_price_cop");
+          break;
+        case "UNCHANGED":
+          whereClauses.push("latest.observed_price_cop = prev.observed_price_cop");
+          break;
+        case "FIRST_OBSERVATION":
+          whereClauses.push("prev.observed_price_cop IS NULL");
+          break;
+      }
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+
+    let orderSql = "ORDER BY p.last_seen_at DESC, p.product_name ASC";
+    switch (options?.sortBy) {
+      case "NAME_ASC":
+        orderSql = "ORDER BY p.product_name ASC";
+        break;
+      case "NAME_DESC":
+        orderSql = "ORDER BY p.product_name DESC";
+        break;
+      case "PRICE_ASC":
+        orderSql = "ORDER BY latest.observed_price_cop ASC, p.product_name ASC";
+        break;
+      case "PRICE_DESC":
+        orderSql = "ORDER BY latest.observed_price_cop DESC, p.product_name ASC";
+        break;
+      case "OBSERVATIONS_DESC":
+        orderSql = "ORDER BY stats.total_obs DESC, p.last_seen_at DESC";
+        break;
+      case "LAST_SEEN_DESC":
+      default:
+        orderSql = "ORDER BY p.last_seen_at DESC, p.product_name ASC";
+        break;
+    }
+
+    const baseCte = `
+      WITH ranked_obs AS (
+        SELECT
+          o.product_variant_key,
+          o.observed_price_cop,
+          o.declared_reference_price_cop,
+          o.observed_at,
+          o.store_key,
+          o.scan_run_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY o.product_variant_key
+            ORDER BY o.observed_at DESC, o.observation_id DESC
+          ) as rn
+        FROM price_observations o
+        WHERE o.is_superseded = 0
+      ),
+      product_obs_stats AS (
+        SELECT
+          product_variant_key,
+          COUNT(*) as total_obs,
+          MIN(observed_price_cop) as min_price,
+          MAX(observed_price_cop) as max_price
+        FROM price_observations
+        WHERE is_superseded = 0
+        GROUP BY product_variant_key
+      )
+    `;
+
+    const countSql = `
+      ${baseCte}
+      SELECT COUNT(*) as c
+      FROM products p
+      JOIN ranked_obs latest ON latest.product_variant_key = p.product_variant_key AND latest.rn = 1
+      LEFT JOIN ranked_obs prev ON prev.product_variant_key = p.product_variant_key AND prev.rn = 2
+      JOIN product_obs_stats stats ON stats.product_variant_key = p.product_variant_key
+      JOIN stores s ON s.store_key = latest.store_key
+      ${whereSql}
+    `;
+
+    const countRow = this.db.prepare(countSql).get(...whereParams) as
+      { c: number } | undefined;
+    const totalCount = Number(countRow?.c ?? 0);
+    const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+
+    if (totalCount === 0) {
+      return {
+        items: [],
+        totalCount: 0,
+        page,
+        pageSize,
+        totalPages: 1,
+      };
+    }
+
+    const selectSql = `
+      ${baseCte}
+      SELECT
+        p.product_variant_key,
+        p.external_product_id,
+        p.external_variant_id,
+        p.product_name,
+        p.brand,
+        p.packaging_label,
+        p.unit_quantity,
+        p.unit_type,
+        p.category_slug,
+        p.canonical_product_url,
+        p.first_seen_at,
+        p.last_seen_at,
+        s.store_name,
+        s.external_store_id,
+        latest.observed_price_cop as latest_price,
+        latest.observed_at as latest_observed_at,
+        prev.observed_price_cop as prev_price,
+        stats.total_obs,
+        sr.source_view_key,
+        sr.source_view_label,
+        opp.opportunity_id as opp_id,
+        opp.opportunity_type as opp_type,
+        opp.label_es_co as opp_label,
+        opp.savings_cop as opp_savings,
+        opp.discount_percentage as opp_pct,
+        opp.confidence as opp_conf
+      FROM products p
+      JOIN ranked_obs latest ON latest.product_variant_key = p.product_variant_key AND latest.rn = 1
+      LEFT JOIN ranked_obs prev ON prev.product_variant_key = p.product_variant_key AND prev.rn = 2
+      JOIN product_obs_stats stats ON stats.product_variant_key = p.product_variant_key
+      JOIN stores s ON s.store_key = latest.store_key
+      LEFT JOIN scan_runs sr ON sr.scan_run_id = latest.scan_run_id
+      LEFT JOIN (
+        SELECT
+          e.opportunity_id,
+          e.product_variant_key,
+          e.opportunity_type,
+          e.label_es_co,
+          e.savings_cop,
+          e.discount_percentage,
+          e.confidence,
+          ROW_NUMBER() OVER (
+            PARTITION BY e.product_variant_key
+            ORDER BY
+              CASE e.opportunity_type
+                WHEN 'HISTORICAL_LOW' THEN 1
+                WHEN 'HISTORICAL_DROP' THEN 2
+                WHEN 'DECLARED_DISCOUNT' THEN 3
+                ELSE 4
+              END,
+              e.detected_at DESC
+          ) as opp_rn
+        FROM opportunity_events e
+        WHERE e.lifecycle_status = 'ACTIVE'
+      ) opp ON opp.product_variant_key = p.product_variant_key AND opp.opp_rn = 1
+      ${whereSql}
+      ${orderSql}
+      LIMIT ? OFFSET ?
+    `;
+
+    const rows = this.db
+      .prepare(selectSql)
+      .all(...whereParams, pageSize, offset) as Array<{
+      product_variant_key: string;
+      external_product_id: string;
+      external_variant_id: string;
+      product_name: string;
+      brand: string | null;
+      packaging_label: string;
+      unit_quantity: number;
+      unit_type: string;
+      category_slug: string;
+      canonical_product_url: string | null;
+      first_seen_at: string;
+      last_seen_at: string;
+      store_name: string;
+      external_store_id: string;
+      latest_price: number;
+      latest_observed_at: string;
+      prev_price: number | null;
+      total_obs: number;
+      source_view_key: string | null;
+      source_view_label: string | null;
+      opp_id: string | null;
+      opp_type: OpportunityType | null;
+      opp_label: string | null;
+      opp_savings: number | null;
+      opp_pct: number | null;
+      opp_conf: string | null;
+    }>;
+
+    const items: CatalogProductSummaryItem[] = rows.map((r) => {
+      const latestPriceCop = createCopAmount(r.latest_price);
+      let previousPriceCop: CopAmount | undefined;
+      let priceDifferenceCop: number | undefined;
+      let priceDifferencePercentage: number | undefined;
+
+      if (r.prev_price !== null) {
+        previousPriceCop = createCopAmount(r.prev_price);
+        priceDifferenceCop = r.latest_price - r.prev_price;
+        if (r.prev_price > 0) {
+          priceDifferencePercentage = Math.round(
+            ((r.latest_price - r.prev_price) / r.prev_price) * 100,
+          );
+        }
+      }
+
+      return {
+        productVariantKey: r.product_variant_key,
+        externalProductId: r.external_product_id,
+        externalVariantId: r.external_variant_id,
+        productName: r.product_name,
+        ...(r.brand !== null ? { brand: r.brand } : {}),
+        packagingLabel: r.packaging_label,
+        unitQuantity: r.unit_quantity,
+        unitType: r.unit_type,
+        categorySlug: r.category_slug,
+        ...(r.canonical_product_url
+          ? { canonicalProductUrl: r.canonical_product_url }
+          : {}),
+        latestPriceCop,
+        ...(previousPriceCop !== undefined ? { previousPriceCop } : {}),
+        ...(priceDifferenceCop !== undefined ? { priceDifferenceCop } : {}),
+        ...(priceDifferencePercentage !== undefined ? { priceDifferencePercentage } : {}),
+        observationCount: r.total_obs,
+        firstObservedAt: r.first_seen_at,
+        lastObservedAt: r.last_seen_at,
+        storeName: r.store_name,
+        externalStoreId: r.external_store_id,
+        ...(r.source_view_key !== null ? { latestSourceViewKey: r.source_view_key } : {}),
+        ...(r.source_view_label !== null
+          ? { latestSourceViewLabel: r.source_view_label }
+          : {}),
+        ...(r.opp_id !== null &&
+        r.opp_type !== null &&
+        r.opp_label !== null &&
+        r.opp_savings !== null &&
+        r.opp_pct !== null &&
+        r.opp_conf !== null
+          ? {
+              activeOpportunity: {
+                opportunityId: createPresentationOpportunityId(r.opp_id),
+                type: r.opp_type,
+                labelEsCo: r.opp_label,
+                savingsCop: createCopAmount(r.opp_savings),
+                discountPercentage: r.opp_pct,
+                confidence: r.opp_conf,
+              },
+            }
+          : {}),
+      };
+    });
+
+    return {
+      items,
+      totalCount,
+      page,
+      pageSize,
+      totalPages,
+    };
+  }
+
+  /**
+   * Retrieves comprehensive product detail, price statistics, observations timeline, and active opportunities (`P4`).
+   */
+  public getProductDetail(productIdOrKey: string): ProductDetailView | undefined {
+    const trimmed = productIdOrKey.trim();
+    if (!trimmed) return undefined;
+
+    // Check if trimmed matches an exact product_variant_key first
+    let productRow = this.db
+      .prepare(
+        `SELECT
+          p.product_variant_key,
+          p.external_product_id,
+          p.external_variant_id,
+          p.product_name,
+          p.brand,
+          p.packaging_label,
+          p.unit_quantity,
+          p.unit_type,
+          p.category_slug,
+          p.canonical_product_url,
+          p.first_seen_at,
+          p.last_seen_at,
+          COALESCE(s.store_name, 'Desconocida') as store_name,
+          COALESCE(s.external_store_id, 'N/A') as external_store_id
+        FROM products p
+        LEFT JOIN price_observations o ON o.product_variant_key = p.product_variant_key AND o.is_superseded = 0
+        LEFT JOIN stores s ON s.store_key = o.store_key
+        WHERE p.product_variant_key = ?
+        ORDER BY o.observed_at DESC
+        LIMIT 1`,
+      )
+      .get(trimmed) as
+      | {
+          product_variant_key: string;
+          external_product_id: string;
+          external_variant_id: string;
+          product_name: string;
+          brand: string | null;
+          packaging_label: string;
+          unit_quantity: number;
+          unit_type: string;
+          category_slug: string;
+          canonical_product_url: string | null;
+          first_seen_at: string;
+          last_seen_at: string;
+          store_name: string;
+          external_store_id: string;
+        }
+      | undefined;
+
+    // If not found by product_variant_key, check if it's an external_product_id
+    if (!productRow) {
+      const matchingKeys = this.db
+        .prepare(`SELECT product_variant_key FROM products WHERE external_product_id = ?`)
+        .all(trimmed) as Array<{ product_variant_key: string }>;
+
+      // If exactly 1 variant exists, resolve safely (preserves legacy single-variant lookup)
+      if (matchingKeys.length === 1 && matchingKeys[0]) {
+        const singleKey = matchingKeys[0].product_variant_key;
+        productRow = this.db
+          .prepare(
+            `SELECT
+              p.product_variant_key,
+              p.external_product_id,
+              p.external_variant_id,
+              p.product_name,
+              p.brand,
+              p.packaging_label,
+              p.unit_quantity,
+              p.unit_type,
+              p.category_slug,
+              p.canonical_product_url,
+              p.first_seen_at,
+              p.last_seen_at,
+              COALESCE(s.store_name, 'Desconocida') as store_name,
+              COALESCE(s.external_store_id, 'N/A') as external_store_id
+            FROM products p
+            LEFT JOIN price_observations o ON o.product_variant_key = p.product_variant_key AND o.is_superseded = 0
+            LEFT JOIN stores s ON s.store_key = o.store_key
+            WHERE p.product_variant_key = ?
+            ORDER BY o.observed_at DESC
+            LIMIT 1`,
+          )
+          .get(singleKey) as typeof productRow;
+      } else {
+        // If matchingKeys.length > 1, the externalProductId is ambiguous across variants!
+        // Returning undefined prevents silently selecting an incorrect variant.
+        return undefined;
+      }
+    }
+
+    if (!productRow) {
+      return undefined;
+    }
+
+    const obsRows = this.db
+      .prepare(
+        `SELECT
+          o.observed_at,
+          o.observed_price_cop,
+          o.declared_reference_price_cop,
+          o.availability,
+          s.store_name,
+          r.source_view_key,
+          r.source_view_label
+        FROM price_observations o
+        JOIN stores s ON s.store_key = o.store_key
+        LEFT JOIN scan_runs r ON r.scan_run_id = o.scan_run_id
+        WHERE o.product_variant_key = ? AND o.is_superseded = 0
+        ORDER BY o.observed_at ASC, o.observation_id ASC`,
+      )
+      .all(productRow.product_variant_key) as Array<{
+      observed_at: string;
+      observed_price_cop: number;
+      declared_reference_price_cop: number | null;
+      availability: string;
+      store_name: string;
+      source_view_key: string | null;
+      source_view_label: string | null;
+    }>;
+
+    const observations: ProductDetailObservationItem[] = obsRows.map((r, idx) => ({
+      presentationId: `obs-${idx + 1}`,
+      observedAt: r.observed_at,
+      observedPriceCop: createCopAmount(r.observed_price_cop),
+      ...(r.declared_reference_price_cop !== null
+        ? { declaredReferencePriceCop: createCopAmount(r.declared_reference_price_cop) }
+        : {}),
+      availability: r.availability,
+      storeName: r.store_name,
+      ...(r.source_view_key !== null ? { sourceViewKey: r.source_view_key } : {}),
+      ...(r.source_view_label !== null ? { sourceViewLabel: r.source_view_label } : {}),
+    }));
+
+    const observationCount = observations.length;
+    let minPrice = Infinity;
+    let maxPrice = -Infinity;
+    let totalPrice = 0;
+
+    for (const ob of observations) {
+      if (ob.observedPriceCop < minPrice) minPrice = ob.observedPriceCop;
+      if (ob.observedPriceCop > maxPrice) maxPrice = ob.observedPriceCop;
+      totalPrice += ob.observedPriceCop;
+    }
+
+    const latestOb = observations[observations.length - 1];
+    const prevOb =
+      observations.length >= 2 ? observations[observations.length - 2] : undefined;
+    const currentPriceCop = latestOb ? latestOb.observedPriceCop : createCopAmount(0);
+    const previousPriceCop = prevOb ? prevOb.observedPriceCop : undefined;
+    const minPriceCop = createCopAmount(minPrice === Infinity ? 0 : minPrice);
+    const maxPriceCop = createCopAmount(maxPrice === -Infinity ? 0 : maxPrice);
+    const averagePriceCop = createCopAmount(
+      observationCount > 0 ? Math.round(totalPrice / observationCount) : 0,
+    );
+
+    let priceDifferenceCop: number | undefined;
+    let priceDifferencePercentage: number | undefined;
+
+    if (previousPriceCop !== undefined) {
+      priceDifferenceCop = currentPriceCop - previousPriceCop;
+      if (previousPriceCop > 0) {
+        priceDifferencePercentage = Math.round(
+          ((currentPriceCop - previousPriceCop) / previousPriceCop) * 100,
+        );
+      }
+    }
+
+    const firstObservedAt = observations[0]?.observedAt ?? productRow.first_seen_at;
+    const lastObservedAt = latestOb?.observedAt ?? productRow.last_seen_at;
+
+    const oppRows = this.db
+      .prepare(
+        `SELECT
+          e.opportunity_id,
+          e.product_variant_key,
+          p.external_product_id,
+          p.external_variant_id,
+          p.product_name,
+          p.brand,
+          p.packaging_label,
+          s.store_name,
+          e.opportunity_type,
+          e.label_es_co,
+          e.baseline_price_cop,
+          e.previous_price_cop,
+          e.observed_price_cop,
+          e.savings_cop,
+          e.discount_percentage,
+          e.confidence,
+          e.detected_at
+        FROM opportunity_events e
+        JOIN products p ON p.product_variant_key = e.product_variant_key
+        JOIN stores s ON s.store_key = e.store_key
+        WHERE e.product_variant_key = ?
+          AND e.lifecycle_status = 'ACTIVE'
+        ORDER BY e.detected_at DESC`,
+      )
+      .all(productRow.product_variant_key) as Array<{
+      opportunity_id: string;
+      product_variant_key: string;
+      external_product_id: string;
+      external_variant_id: string;
+      product_name: string;
+      brand: string | null;
+      packaging_label: string;
+      store_name: string;
+      opportunity_type: OpportunityType;
+      label_es_co: string;
+      baseline_price_cop: number;
+      previous_price_cop: number | null;
+      observed_price_cop: number;
+      savings_cop: number;
+      discount_percentage: number;
+      confidence: ConfidenceLevel;
+      detected_at: string;
+    }>;
+
+    const activeOpportunities: DashboardOpportunityItem[] = oppRows.map((r) => ({
+      opportunityId: createPresentationOpportunityId(r.opportunity_id),
+      productVariantKey: r.product_variant_key,
+      externalProductId: r.external_product_id,
+      externalVariantId: r.external_variant_id,
+      productName: r.product_name,
+      ...(r.brand !== null ? { brand: r.brand } : {}),
+      packagingLabel: r.packaging_label,
+      storeName: r.store_name,
+      opportunityType: r.opportunity_type,
+      labelEsCo: r.label_es_co,
+      baselinePriceCop: createCopAmount(r.baseline_price_cop),
+      ...(r.previous_price_cop !== null
+        ? { previousPriceCop: createCopAmount(r.previous_price_cop) }
+        : {}),
+      observedPriceCop: createCopAmount(r.observed_price_cop),
+      savingsCop: createCopAmount(r.savings_cop),
+      discountPercentage: r.discount_percentage,
+      confidence: r.confidence,
+      detectedAt: r.detected_at,
+    }));
+
+    return {
+      product: {
+        productVariantKey: productRow.product_variant_key,
+        externalProductId: productRow.external_product_id,
+        externalVariantId: productRow.external_variant_id,
+        productName: productRow.product_name,
+        ...(productRow.brand !== null ? { brand: productRow.brand } : {}),
+        packagingLabel: productRow.packaging_label,
+        unitQuantity: productRow.unit_quantity,
+        unitType: productRow.unit_type,
+        categorySlug: productRow.category_slug,
+        ...(productRow.canonical_product_url
+          ? { canonicalProductUrl: productRow.canonical_product_url }
+          : {}),
+        storeName: productRow.store_name,
+        externalStoreId: productRow.external_store_id,
+        firstSeenAt: productRow.first_seen_at,
+        lastSeenAt: productRow.last_seen_at,
+      },
+      statistics: {
+        currentPriceCop,
+        ...(previousPriceCop !== undefined ? { previousPriceCop } : {}),
+        ...(priceDifferenceCop !== undefined ? { priceDifferenceCop } : {}),
+        ...(priceDifferencePercentage !== undefined ? { priceDifferencePercentage } : {}),
+        minPriceCop,
+        maxPriceCop,
+        averagePriceCop,
+        observationCount,
+        firstObservedAt,
+        lastObservedAt,
+        hasSufficientHistory: observationCount >= 2,
+      },
+      observations,
+      activeOpportunities,
+    };
+  }
+
+  /**
+   * Returns a paginated list of active opportunities with search, type filter, and custom sorting (`P4`).
+   */
+  public listActiveOpportunities(
+    options?: ListActiveOpportunitiesOptions,
+  ): PaginatedResult<DashboardOpportunityItem> {
+    const page = Math.max(1, options?.page ?? 1);
+    const pageSize = Math.min(100, Math.max(1, options?.pageSize ?? 20));
+    const offset = (page - 1) * pageSize;
+
+    const whereClauses: string[] = ["e.lifecycle_status = 'ACTIVE'"];
+    const whereParams: Array<string | number> = [];
+
+    const search = (options?.search ?? "").trim();
+    if (search) {
+      whereClauses.push(
+        "(p.product_name LIKE ? OR p.external_product_id = ? OR e.label_es_co LIKE ?)",
+      );
+      const pattern = `%${search}%`;
+      whereParams.push(pattern, search, pattern);
+    }
+
+    if (options?.type) {
+      whereClauses.push("e.opportunity_type = ?");
+      whereParams.push(options.type);
+    }
+
+    const whereSql = `WHERE ${whereClauses.join(" AND ")}`;
+
+    let orderSql = "ORDER BY e.discount_basis_points DESC, e.detected_at DESC";
+    switch (options?.sortBy) {
+      case "DISCOUNT_ASC":
+        orderSql = "ORDER BY e.discount_basis_points ASC, e.detected_at DESC";
+        break;
+      case "SAVINGS_DESC":
+        orderSql = "ORDER BY e.savings_cop DESC, e.detected_at DESC";
+        break;
+      case "SAVINGS_ASC":
+        orderSql = "ORDER BY e.savings_cop ASC, e.detected_at DESC";
+        break;
+      case "DATE_DESC":
+        orderSql = "ORDER BY e.detected_at DESC, e.opportunity_id DESC";
+        break;
+      case "DATE_ASC":
+        orderSql = "ORDER BY e.detected_at ASC, e.opportunity_id ASC";
+        break;
+      case "DISCOUNT_DESC":
+      default:
+        orderSql = "ORDER BY e.discount_basis_points DESC, e.detected_at DESC";
+        break;
+    }
+
+    const countSql = `
+      SELECT COUNT(*) as c
+      FROM opportunity_events e
+      JOIN products p ON p.product_variant_key = e.product_variant_key
+      JOIN stores s ON s.store_key = e.store_key
+      ${whereSql}
+    `;
+
+    const countRow = this.db.prepare(countSql).get(...whereParams) as
+      { c: number } | undefined;
+    const totalCount = Number(countRow?.c ?? 0);
+    const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+
+    if (totalCount === 0) {
+      return {
+        items: [],
+        totalCount: 0,
+        page,
+        pageSize,
+        totalPages: 1,
+      };
+    }
+
+    const selectSql = `
+      SELECT
+        e.opportunity_id,
+        e.product_variant_key,
+        p.external_product_id,
+        p.external_variant_id,
+        p.product_name,
+        p.brand,
+        p.packaging_label,
+        s.store_name,
+        e.opportunity_type,
+        e.label_es_co,
+        e.baseline_price_cop,
+        e.previous_price_cop,
+        e.observed_price_cop,
+        e.savings_cop,
+        e.discount_percentage,
+        e.confidence,
+        e.detected_at
+      FROM opportunity_events e
+      JOIN products p ON p.product_variant_key = e.product_variant_key
+      JOIN stores s ON s.store_key = e.store_key
+      ${whereSql}
+      ${orderSql}
+      LIMIT ? OFFSET ?
+    `;
+
+    const rows = this.db
+      .prepare(selectSql)
+      .all(...whereParams, pageSize, offset) as Array<{
+      opportunity_id: string;
+      product_variant_key: string;
+      external_product_id: string;
+      external_variant_id: string;
+      product_name: string;
+      brand: string | null;
+      packaging_label: string;
+      store_name: string;
+      opportunity_type: OpportunityType;
+      label_es_co: string;
+      baseline_price_cop: number;
+      previous_price_cop: number | null;
+      observed_price_cop: number;
+      savings_cop: number;
+      discount_percentage: number;
+      confidence: ConfidenceLevel;
+      detected_at: string;
+    }>;
+
+    const items: DashboardOpportunityItem[] = rows.map((r) => ({
+      opportunityId: createPresentationOpportunityId(r.opportunity_id),
+      productVariantKey: r.product_variant_key,
+      externalProductId: r.external_product_id,
+      externalVariantId: r.external_variant_id,
+      productName: r.product_name,
+      ...(r.brand !== null ? { brand: r.brand } : {}),
+      packagingLabel: r.packaging_label,
+      storeName: r.store_name,
+      opportunityType: r.opportunity_type,
+      labelEsCo: r.label_es_co,
+      baselinePriceCop: createCopAmount(r.baseline_price_cop),
+      ...(r.previous_price_cop !== null
+        ? { previousPriceCop: createCopAmount(r.previous_price_cop) }
+        : {}),
+      observedPriceCop: createCopAmount(r.observed_price_cop),
+      savingsCop: createCopAmount(r.savings_cop),
+      discountPercentage: r.discount_percentage,
+      confidence: r.confidence,
+      detectedAt: r.detected_at,
+    }));
+
+    return {
+      items,
+      totalCount,
+      page,
+      pageSize,
+      totalPages,
+    };
+  }
+}
+
+export interface DashboardOpportunityItem {
+  readonly opportunityId: string;
+  readonly productVariantKey: string;
+  readonly externalProductId: string;
+  readonly externalVariantId: string;
+  readonly productName: string;
+  readonly brand?: string;
+  readonly packagingLabel: string;
+  readonly storeName: string;
+  readonly opportunityType: OpportunityType;
+  readonly labelEsCo: string;
+  readonly baselinePriceCop: CopAmount;
+  readonly previousPriceCop?: CopAmount;
+  readonly observedPriceCop: CopAmount;
+  readonly savingsCop: CopAmount;
+  readonly discountPercentage: number;
+  readonly confidence: ConfidenceLevel;
+  readonly detectedAt: string;
+}
+
+export interface ProductDetailObservationItem {
+  readonly presentationId: string;
+  readonly observedAt: string;
+  readonly observedPriceCop: CopAmount;
+  readonly declaredReferencePriceCop?: CopAmount;
+  readonly availability: string;
+  readonly storeName: string;
+  readonly sourceViewKey?: string;
+  readonly sourceViewLabel?: string;
+}
+
+export interface DashboardSummary {
+  readonly counts: {
+    readonly totalDistinctProducts: number;
+    readonly totalActiveObservations: number;
+    readonly activeOpportunitiesCount: number;
+    readonly historicalLowsCount: number;
+    readonly totalScanRuns: number;
+    readonly totalInspectedViews: number;
+  };
+  readonly latestObservationAt?: string;
+  readonly latestScanRun?: {
+    readonly scanRunId: string;
+    readonly startedAt: string;
+    readonly sourceViewKey?: string;
+    readonly sourceViewLabel?: string;
+    readonly newProductsDiscovered: number;
+  };
+  readonly topOpportunities: readonly DashboardOpportunityItem[];
+  readonly recentlyObservedProducts: readonly CatalogProductSummaryItem[];
+  readonly freshnessStatus: "RECENT" | "MODERATE" | "STALE" | "EMPTY";
+}
+
+export interface ListCatalogProductsOptions {
+  readonly search?: string;
+  readonly sourceViewKey?: string;
+  readonly priceChange?: "DROPPED" | "INCREASED" | "UNCHANGED" | "FIRST_OBSERVATION";
+  readonly page?: number;
+  readonly pageSize?: number;
+  readonly sortBy?:
+    | "NAME_ASC"
+    | "NAME_DESC"
+    | "PRICE_ASC"
+    | "PRICE_DESC"
+    | "LAST_SEEN_DESC"
+    | "OBSERVATIONS_DESC";
+}
+
+export interface CatalogProductSummaryItem {
+  readonly productVariantKey: string;
+  readonly externalProductId: string;
+  readonly externalVariantId: string;
+  readonly productName: string;
+  readonly brand?: string;
+  readonly packagingLabel: string;
+  readonly unitQuantity: number;
+  readonly unitType: string;
+  readonly categorySlug: string;
+  readonly canonicalProductUrl?: string;
+  readonly latestPriceCop: CopAmount;
+  readonly previousPriceCop?: CopAmount;
+  readonly priceDifferenceCop?: number;
+  readonly priceDifferencePercentage?: number;
+  readonly observationCount: number;
+  readonly firstObservedAt: string;
+  readonly lastObservedAt: string;
+  readonly storeName: string;
+  readonly externalStoreId: string;
+  readonly latestSourceViewKey?: string;
+  readonly latestSourceViewLabel?: string;
+  readonly activeOpportunity?: {
+    readonly opportunityId: string;
+    readonly type: OpportunityType;
+    readonly labelEsCo: string;
+    readonly savingsCop: CopAmount;
+    readonly discountPercentage: number;
+    readonly confidence: string;
+  };
+}
+
+export interface PaginatedResult<T> {
+  readonly items: readonly T[];
+  readonly totalCount: number;
+  readonly page: number;
+  readonly pageSize: number;
+  readonly totalPages: number;
+}
+
+export interface ProductDetailView {
+  readonly product: {
+    readonly productVariantKey: string;
+    readonly externalProductId: string;
+    readonly externalVariantId: string;
+    readonly productName: string;
+    readonly brand?: string;
+    readonly packagingLabel: string;
+    readonly unitQuantity: number;
+    readonly unitType: string;
+    readonly categorySlug: string;
+    readonly canonicalProductUrl?: string;
+    readonly storeName: string;
+    readonly externalStoreId: string;
+    readonly firstSeenAt: string;
+    readonly lastSeenAt: string;
+  };
+  readonly statistics: {
+    readonly currentPriceCop: CopAmount;
+    readonly previousPriceCop?: CopAmount;
+    readonly priceDifferenceCop?: number;
+    readonly priceDifferencePercentage?: number;
+    readonly minPriceCop: CopAmount;
+    readonly maxPriceCop: CopAmount;
+    readonly averagePriceCop: CopAmount;
+    readonly observationCount: number;
+    readonly firstObservedAt: string;
+    readonly lastObservedAt: string;
+    readonly hasSufficientHistory: boolean;
+  };
+  readonly observations: readonly ProductDetailObservationItem[];
+  readonly activeOpportunities: readonly DashboardOpportunityItem[];
+}
+
+export interface ListActiveOpportunitiesOptions {
+  readonly search?: string;
+  readonly type?: OpportunityType;
+  readonly sortBy?:
+    | "DISCOUNT_DESC"
+    | "DISCOUNT_ASC"
+    | "SAVINGS_DESC"
+    | "SAVINGS_ASC"
+    | "DATE_DESC"
+    | "DATE_ASC";
+  readonly page?: number;
+  readonly pageSize?: number;
 }
