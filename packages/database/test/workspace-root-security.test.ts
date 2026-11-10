@@ -129,32 +129,146 @@ describe("Workspace Root Resolution & Database Path Security (P4 Runtime Fix)", 
       }).toThrow(/must reside outside the Git repository/);
     });
 
-    it("rejects symlink aliases pointing into the workspace", () => {
+    // 1. Existing directory symlink pointing into workspace
+    it("1. rejects an existing directory symlink pointing into the workspace", () => {
       const root = resolveWorkspaceRoot();
       const symlinkOutsideToInside = path.join(tempDir, "symlink-into-packages");
-
-      // Create a symlink in tempDir pointing into <root>/packages
       fs.symlinkSync(path.join(root, "packages"), symlinkOutsideToInside);
 
-      // Path appears lexically outside the repository (starts with tempDir),
-      // but canonically resolves inside the repository!
-      const aliasedDbPath = path.join(symlinkOutsideToInside, "database", "pwn.sqlite");
+      const targetPath = path.join(symlinkOutsideToInside, "database", "pwn.sqlite");
+      expect(() => {
+        assertDatabasePathOutsideRepository(targetPath);
+      }).toThrow(/resolves inside the Git repository/);
 
       expect(() => {
-        assertDatabasePathOutsideRepository(aliasedDbPath);
+        new SqlitePrivateHistoryRepository(targetPath);
+      }).toThrow(/resolves inside the Git repository/);
+
+      expect(fs.existsSync(path.join(root, "packages", "database", "pwn.sqlite"))).toBe(
+        false,
+      );
+    });
+
+    // 2. Existing file symlink pointing into workspace
+    it("2. rejects an existing file symlink pointing into the workspace", () => {
+      const root = resolveWorkspaceRoot();
+      const realFileInWorkspace = path.join(root, "package.json");
+      const symlinkToFile = path.join(tempDir, "alias-package-json.sqlite");
+      fs.symlinkSync(realFileInWorkspace, symlinkToFile);
+
+      expect(() => {
+        assertDatabasePathOutsideRepository(symlinkToFile);
+      }).toThrow(/resolves inside the Git repository/);
+
+      expect(() => {
+        new SqlitePrivateHistoryRepository(symlinkToFile);
       }).toThrow(/resolves inside the Git repository/);
     });
 
-    it("rejects symlinked database files pointing into the workspace even when the file does not exist yet", () => {
+    // 3. Dangling file symlink whose destination is a nonexistent file inside workspace (F6-01)
+    it("3. rejects a dangling file symlink pointing to a nonexistent file inside the workspace (F6-01)", () => {
       const root = resolveWorkspaceRoot();
-      const symlinkParent = path.join(tempDir, "symlink-to-root");
+      const targetInWorkspace = path.join(root, "private-infiltrate.sqlite");
+      const danglingSymlink = path.join(tempDir, "dangling-alias.sqlite");
+      fs.symlinkSync(targetInWorkspace, danglingSymlink);
 
-      fs.symlinkSync(root, symlinkParent);
-      const nonExistentDb = path.join(symlinkParent, "new-file-never-created.sqlite");
+      // Verify prerequisite: target does not exist on disk
+      expect(fs.existsSync(targetInWorkspace)).toBe(false);
 
       expect(() => {
-        assertDatabasePathOutsideRepository(nonExistentDb);
+        assertDatabasePathOutsideRepository(danglingSymlink);
       }).toThrow(/resolves inside the Git repository/);
+
+      expect(() => {
+        new SqlitePrivateHistoryRepository(danglingSymlink);
+      }).toThrow(/resolves inside the Git repository/);
+
+      // Crucial assertion: failed validation must NEVER create files in the workspace!
+      expect(fs.existsSync(targetInWorkspace)).toBe(false);
+    });
+
+    // 4. Relative symlink to a nonexistent workspace file
+    it("4. rejects a relative symlink pointing to a nonexistent workspace file", () => {
+      const root = resolveWorkspaceRoot();
+      const subDir = path.join(tempDir, "subfolder");
+      fs.mkdirSync(subDir, { recursive: true });
+
+      const targetInWorkspace = path.join(root, "relative-target.sqlite");
+      const relativeDest = path.relative(subDir, targetInWorkspace);
+      const relSymlink = path.join(subDir, "rel-alias.sqlite");
+      fs.symlinkSync(relativeDest, relSymlink);
+
+      expect(fs.existsSync(targetInWorkspace)).toBe(false);
+
+      expect(() => {
+        assertDatabasePathOutsideRepository(relSymlink);
+      }).toThrow(/resolves inside the Git repository/);
+
+      expect(() => {
+        new SqlitePrivateHistoryRepository(relSymlink);
+      }).toThrow(/resolves inside the Git repository/);
+
+      expect(fs.existsSync(targetInWorkspace)).toBe(false);
+    });
+
+    // 5. Cyclic symlinks
+    it("5. detects and rejects cyclic symlinks", () => {
+      const loop1 = path.join(tempDir, "loop-a.sqlite");
+      const loop2 = path.join(tempDir, "loop-b.sqlite");
+      fs.symlinkSync(loop2, loop1);
+      fs.symlinkSync(loop1, loop2);
+
+      expect(() => {
+        assertDatabasePathOutsideRepository(loop1);
+      }).toThrow(/cyclic or excessively nested symbolic link detected/);
+
+      expect(() => {
+        new SqlitePrivateHistoryRepository(loop1);
+      }).toThrow(/cyclic or excessively nested symbolic link detected/);
+
+      // Also self-referential symlink
+      const selfLoop = path.join(tempDir, "self-loop.sqlite");
+      fs.symlinkSync(selfLoop, selfLoop);
+
+      expect(() => {
+        assertDatabasePathOutsideRepository(selfLoop);
+      }).toThrow(/cyclic or excessively nested symbolic link detected/);
+    });
+
+    // 6. Valid outside-workspace symlink
+    it("6. allows a valid symlink whose target is entirely outside the workspace", () => {
+      const realTargetOutside = path.join(tempDir, "real-target.sqlite");
+      const symlinkOutside = path.join(tempDir, "symlink-outside.sqlite");
+      fs.symlinkSync(realTargetOutside, symlinkOutside);
+
+      expect(() => {
+        assertDatabasePathOutsideRepository(symlinkOutside);
+      }).not.toThrow();
+    });
+
+    // 7. Nonexistent ordinary database path outside workspace
+    it("7. allows a nonexistent ordinary database path outside the workspace", () => {
+      const brandNewOutside = path.join(tempDir, "sub1", "sub2", "brand-new.sqlite");
+      expect(fs.existsSync(brandNewOutside)).toBe(false);
+
+      expect(() => {
+        assertDatabasePathOutsideRepository(brandNewOutside);
+      }).not.toThrow();
+    });
+
+    // 8. Existing P2/P3 CLI path behavior
+    it("8. preserves default private SQLite storage path outside the workspace", () => {
+      const defaultPath = path.join(
+        os.homedir(),
+        ".local",
+        "share",
+        "priceradar",
+        "private-history.sqlite",
+      );
+
+      expect(() => {
+        assertDatabasePathOutsideRepository(defaultPath);
+      }).not.toThrow();
     });
 
     it("SqlitePrivateHistoryRepository constructor rejects inside-workspace paths", () => {

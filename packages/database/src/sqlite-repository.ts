@@ -634,28 +634,86 @@ export function resolveWorkspaceRoot(): string {
 }
 
 /**
- * Canonicalizes a path, resolving all symlinks on existing ancestor directories.
- * This ensures that even if `dbPath` does not exist yet, any symlinks in its parent
- * hierarchy (e.g. /var -> /private/var on macOS, or symlinked folders inside the repo)
- * are fully resolved to their canonical target.
+ * Canonicalizes a path, resolving all symbolic links (including dangling, relative, and chained symlinks)
+ * and resolving existing ancestor directories to their canonical realpaths.
+ *
+ * Guarantees that if any segment (leaf or ancestor) is a symlink pointing into the workspace,
+ * its canonical destination is fully resolved even if the target file does not yet exist.
+ *
+ * Detects cyclic symlinks and fails closed with a Security violation.
  */
-export function getCanonicalPath(targetPath: string): string {
-  const resolved = path.resolve(targetPath);
-  let current = resolved;
-  const tail: string[] = [];
-
-  while (!fs.existsSync(current)) {
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    tail.unshift(path.basename(current));
-    current = parent;
+export function getCanonicalPath(
+  targetPath: string,
+  hops = 0,
+  seen = new Set<string>(),
+): string {
+  const MAX_SYMLINKS = 40;
+  if (hops > MAX_SYMLINKS) {
+    throw new Error(
+      `Security violation: cyclic or excessively nested symbolic link detected in SQLite database path: '${targetPath}'`,
+    );
   }
 
+  const resolved = path.resolve(targetPath);
+
+  // Check if candidate itself is a symlink or exists (lstat succeeds even if link is dangling)
+  let stat: fs.Stats;
   try {
-    const realCurrent = fs.realpathSync(current);
-    return path.resolve(realCurrent, ...tail);
-  } catch {
-    return resolved;
+    stat = fs.lstatSync(resolved);
+  } catch (err: unknown) {
+    const e = err as { code?: string; message?: string };
+    if (e && e.code === "ENOENT") {
+      // Path does not exist as file, directory, or symlink.
+      // Canonicalize existing parent directory and append the basename.
+      const parent = path.dirname(resolved);
+      if (parent === resolved) {
+        return resolved;
+      }
+      const canonicalParent = getCanonicalPath(parent, hops, seen);
+      return path.join(canonicalParent, path.basename(resolved));
+    }
+    throw new Error(
+      `Security violation: filesystem canonicalization check failed for '${targetPath}': ${e.message ?? String(err)}`,
+    );
+  }
+
+  if (stat.isSymbolicLink()) {
+    if (seen.has(resolved)) {
+      throw new Error(
+        `Security violation: cyclic or excessively nested symbolic link detected in SQLite database path: '${targetPath}'`,
+      );
+    }
+    seen.add(resolved);
+
+    let linkTarget: string;
+    try {
+      linkTarget = fs.readlinkSync(resolved);
+    } catch (e: unknown) {
+      throw new Error(
+        `Security violation: failed to read symbolic link '${resolved}': ${(e as { message?: string })?.message ?? String(e)}`,
+      );
+    }
+
+    const destination = path.isAbsolute(linkTarget)
+      ? path.resolve(linkTarget)
+      : path.resolve(path.dirname(resolved), linkTarget);
+
+    return getCanonicalPath(destination, hops + 1, seen);
+  }
+
+  // Not a symlink and exists on filesystem
+  try {
+    return fs.realpathSync(resolved);
+  } catch (err: unknown) {
+    const e = err as { code?: string; message?: string };
+    if (e && e.code === "ELOOP") {
+      throw new Error(
+        `Security violation: cyclic or excessively nested symbolic link detected in SQLite database path: '${targetPath}'`,
+      );
+    }
+    throw new Error(
+      `Security violation: unable to canonicalize path '${targetPath}': ${e.message ?? String(err)}`,
+    );
   }
 }
 
