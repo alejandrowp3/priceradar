@@ -29,7 +29,10 @@ import {
 } from "./private-history-cli.ts";
 import { executeDiscoveryScan } from "./scanner.ts";
 
-const WORKSPACE_ENV_LOCAL_PATH = path.resolve(import.meta.dirname, "../../../.env.local");
+const cliDir =
+  (import.meta as { dirname?: string }).dirname ??
+  path.dirname(fileURLToPath(import.meta.url));
+const WORKSPACE_ENV_LOCAL_PATH = path.resolve(cliDir, "../../../.env.local");
 
 const CONTROLLED_SIMULATION_HMAC_SECRET =
   "a3f89012e4b7c65d18293a4b5c6d7e8f90123456789abcdef0123456789abcde";

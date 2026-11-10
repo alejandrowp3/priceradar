@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import type {
   AvailabilityStatus,
   ConfidenceLevel,
@@ -545,20 +546,145 @@ export function assertPersistedFieldSafe(
   }
 }
 
-function resolveWorkspaceRoot(): string {
-  return path.resolve(import.meta.dirname, "../../..");
+/**
+ * Helper to determine if a directory is the PriceRadar workspace root.
+ * Validates presence of `pnpm-workspace.yaml` and `package.json` with name `priceradar`.
+ */
+function isPriceRadarWorkspaceRoot(candidate: string): boolean {
+  try {
+    const pnpmWorkspace = path.join(candidate, "pnpm-workspace.yaml");
+    const pkgJsonPath = path.join(candidate, "package.json");
+    if (!fs.existsSync(pnpmWorkspace) || !fs.existsSync(pkgJsonPath)) {
+      return false;
+    }
+    const pkgContent = fs.readFileSync(pkgJsonPath, "utf-8");
+    const pkg = JSON.parse(pkgContent) as { name?: string };
+    return pkg.name === "priceradar";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ascends from a starting directory seeking the repository root.
+ */
+function findWorkspaceRootFrom(startDir: string): string | undefined {
+  let current = path.resolve(startDir);
+  while (true) {
+    if (isPriceRadarWorkspaceRoot(current)) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return undefined;
+}
+
+/**
+ * Resolves the workspace root safely across:
+ * - Direct Node.js ESM execution (where import.meta.dirname or import.meta.url are present)
+ * - Next.js server bundling (where import.meta.dirname is undefined, but import.meta.url or process.cwd are present)
+ * - Different working directories (e.g. apps/web, apps/worker, or foreign directories)
+ * - Explicit environment variable override PRICERADAR_WORKSPACE_ROOT (validated for safety)
+ *
+ * Fails closed if the root cannot be definitively identified.
+ */
+export function resolveWorkspaceRoot(): string {
+  // 1. Explicit env var override (validated)
+  if (process.env.PRICERADAR_WORKSPACE_ROOT) {
+    const envCandidate = path.resolve(process.env.PRICERADAR_WORKSPACE_ROOT);
+    if (isPriceRadarWorkspaceRoot(envCandidate)) {
+      return envCandidate;
+    }
+    throw new Error(
+      `Security violation: PRICERADAR_WORKSPACE_ROOT is set to '${process.env.PRICERADAR_WORKSPACE_ROOT}', which is not a valid PriceRadar workspace root.`,
+    );
+  }
+
+  // 2. Try from import.meta.dirname if present in standard Node ESM
+  const metaDirname = (import.meta as { dirname?: string }).dirname;
+  if (typeof metaDirname === "string" && metaDirname.trim()) {
+    const found = findWorkspaceRootFrom(metaDirname);
+    if (found) return found;
+  }
+
+  // 3. Try from import.meta.url (handles file URLs when dirname is stripped by bundlers)
+  if (typeof import.meta.url === "string" && import.meta.url.startsWith("file://")) {
+    try {
+      const metaFilePath = fileURLToPath(import.meta.url);
+      const metaDir = path.dirname(metaFilePath);
+      const found = findWorkspaceRootFrom(metaDir);
+      if (found) return found;
+    } catch {
+      // Ignore file URL conversion errors and continue to cwd
+    }
+  }
+
+  // 4. Try from process.cwd() (climbing upwards to handle monorepo subdirectories)
+  const cwdFound = findWorkspaceRootFrom(process.cwd());
+  if (cwdFound) return cwdFound;
+
+  // 5. Fail closed
+  throw new Error(
+    "Security violation: unable to safely resolve PriceRadar workspace root. Failed closed to prevent potential repository path traversal.",
+  );
+}
+
+/**
+ * Canonicalizes a path, resolving all symlinks on existing ancestor directories.
+ * This ensures that even if `dbPath` does not exist yet, any symlinks in its parent
+ * hierarchy (e.g. /var -> /private/var on macOS, or symlinked folders inside the repo)
+ * are fully resolved to their canonical target.
+ */
+export function getCanonicalPath(targetPath: string): string {
+  const resolved = path.resolve(targetPath);
+  let current = resolved;
+  const tail: string[] = [];
+
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    tail.unshift(path.basename(current));
+    current = parent;
+  }
+
+  try {
+    const realCurrent = fs.realpathSync(current);
+    return path.resolve(realCurrent, ...tail);
+  } catch {
+    return resolved;
+  }
 }
 
 export function assertDatabasePathOutsideRepository(dbPath: string): void {
   if (dbPath === ":memory:") return;
+
   const resolvedDbPath = path.resolve(dbPath);
   const workspaceRoot = resolveWorkspaceRoot();
+
+  // 1. Lexical containment check
   if (
     resolvedDbPath === workspaceRoot ||
     resolvedDbPath.startsWith(`${workspaceRoot}${path.sep}`)
   ) {
     throw new Error(
       `Security violation: SQLite database path '${resolvedDbPath}' must reside outside the Git repository ('${workspaceRoot}'). Use ~/.local/share/priceradar/private-history.sqlite or a temporary directory outside the repository.`,
+    );
+  }
+
+  // 2. Canonical realpath containment check (prevents symlink / aliasing bypasses)
+  const canonicalDbPath = getCanonicalPath(resolvedDbPath);
+  const canonicalWorkspaceRoot = getCanonicalPath(workspaceRoot);
+
+  if (
+    canonicalDbPath === canonicalWorkspaceRoot ||
+    canonicalDbPath.startsWith(`${canonicalWorkspaceRoot}${path.sep}`)
+  ) {
+    throw new Error(
+      `Security violation: SQLite database path '${resolvedDbPath}' (canonical: '${canonicalDbPath}') resolves inside the Git repository ('${canonicalWorkspaceRoot}'). Use ~/.local/share/priceradar/private-history.sqlite or a temporary directory outside the repository.`,
     );
   }
 }
