@@ -15,7 +15,11 @@ const ALLOWED_HOSTS = new Set([
  */
 export function middleware(request: NextRequest): NextResponse {
   const host = request.headers.get("host") ?? "";
-  if (!ALLOWED_HOSTS.has(host)) {
+  const [hostname] = host.split(":");
+  const isLoopback =
+    ALLOWED_HOSTS.has(host) || hostname === "127.0.0.1" || hostname === "localhost";
+
+  if (!isLoopback) {
     return new NextResponse(
       JSON.stringify({
         error: "Acceso prohibido: PriceRadar es una aplicación exclusivamente local.",

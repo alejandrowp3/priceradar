@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import type {
   AvailabilityStatus,
   ConfidenceLevel,
@@ -545,20 +546,203 @@ export function assertPersistedFieldSafe(
   }
 }
 
-function resolveWorkspaceRoot(): string {
-  return path.resolve(import.meta.dirname, "../../..");
+/**
+ * Helper to determine if a directory is the PriceRadar workspace root.
+ * Validates presence of `pnpm-workspace.yaml` and `package.json` with name `priceradar`.
+ */
+function isPriceRadarWorkspaceRoot(candidate: string): boolean {
+  try {
+    const pnpmWorkspace = path.join(candidate, "pnpm-workspace.yaml");
+    const pkgJsonPath = path.join(candidate, "package.json");
+    if (!fs.existsSync(pnpmWorkspace) || !fs.existsSync(pkgJsonPath)) {
+      return false;
+    }
+    const pkgContent = fs.readFileSync(pkgJsonPath, "utf-8");
+    const pkg = JSON.parse(pkgContent) as { name?: string };
+    return pkg.name === "priceradar";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ascends from a starting directory seeking the repository root.
+ */
+function findWorkspaceRootFrom(startDir: string): string | undefined {
+  let current = path.resolve(startDir);
+  while (true) {
+    if (isPriceRadarWorkspaceRoot(current)) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return undefined;
+}
+
+/**
+ * Resolves the workspace root safely across:
+ * - Direct Node.js ESM execution (where import.meta.dirname or import.meta.url are present)
+ * - Next.js server bundling (where import.meta.dirname is undefined, but import.meta.url or process.cwd are present)
+ * - Different working directories (e.g. apps/web, apps/worker, or foreign directories)
+ * - Explicit environment variable override PRICERADAR_WORKSPACE_ROOT (validated for safety)
+ *
+ * Fails closed if the root cannot be definitively identified.
+ */
+export function resolveWorkspaceRoot(): string {
+  // 1. Explicit env var override (validated)
+  if (process.env.PRICERADAR_WORKSPACE_ROOT) {
+    const envCandidate = path.resolve(process.env.PRICERADAR_WORKSPACE_ROOT);
+    if (isPriceRadarWorkspaceRoot(envCandidate)) {
+      return envCandidate;
+    }
+    throw new Error(
+      `Security violation: PRICERADAR_WORKSPACE_ROOT is set to '${process.env.PRICERADAR_WORKSPACE_ROOT}', which is not a valid PriceRadar workspace root.`,
+    );
+  }
+
+  // 2. Try from import.meta.dirname if present in standard Node ESM
+  const metaDirname = (import.meta as { dirname?: string }).dirname;
+  if (typeof metaDirname === "string" && metaDirname.trim()) {
+    const found = findWorkspaceRootFrom(metaDirname);
+    if (found) return found;
+  }
+
+  // 3. Try from import.meta.url (handles file URLs when dirname is stripped by bundlers)
+  if (typeof import.meta.url === "string" && import.meta.url.startsWith("file://")) {
+    try {
+      const metaFilePath = fileURLToPath(import.meta.url);
+      const metaDir = path.dirname(metaFilePath);
+      const found = findWorkspaceRootFrom(metaDir);
+      if (found) return found;
+    } catch {
+      // Ignore file URL conversion errors and continue to cwd
+    }
+  }
+
+  // 4. Try from process.cwd() (climbing upwards to handle monorepo subdirectories)
+  const cwdFound = findWorkspaceRootFrom(process.cwd());
+  if (cwdFound) return cwdFound;
+
+  // 5. Fail closed
+  throw new Error(
+    "Security violation: unable to safely resolve PriceRadar workspace root. Failed closed to prevent potential repository path traversal.",
+  );
+}
+
+/**
+ * Canonicalizes a path, resolving all symbolic links (including dangling, relative, and chained symlinks)
+ * and resolving existing ancestor directories to their canonical realpaths.
+ *
+ * Guarantees that if any segment (leaf or ancestor) is a symlink pointing into the workspace,
+ * its canonical destination is fully resolved even if the target file does not yet exist.
+ *
+ * Detects cyclic symlinks and fails closed with a Security violation.
+ */
+export function getCanonicalPath(
+  targetPath: string,
+  hops = 0,
+  seen = new Set<string>(),
+): string {
+  const MAX_SYMLINKS = 40;
+  if (hops > MAX_SYMLINKS) {
+    throw new Error(
+      `Security violation: cyclic or excessively nested symbolic link detected in SQLite database path: '${targetPath}'`,
+    );
+  }
+
+  const resolved = path.resolve(targetPath);
+
+  // Check if candidate itself is a symlink or exists (lstat succeeds even if link is dangling)
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(resolved);
+  } catch (err: unknown) {
+    const e = err as { code?: string; message?: string };
+    if (e && e.code === "ENOENT") {
+      // Path does not exist as file, directory, or symlink.
+      // Canonicalize existing parent directory and append the basename.
+      const parent = path.dirname(resolved);
+      if (parent === resolved) {
+        return resolved;
+      }
+      const canonicalParent = getCanonicalPath(parent, hops, seen);
+      return path.join(canonicalParent, path.basename(resolved));
+    }
+    throw new Error(
+      `Security violation: filesystem canonicalization check failed for '${targetPath}': ${e.message ?? String(err)}`,
+    );
+  }
+
+  if (stat.isSymbolicLink()) {
+    if (seen.has(resolved)) {
+      throw new Error(
+        `Security violation: cyclic or excessively nested symbolic link detected in SQLite database path: '${targetPath}'`,
+      );
+    }
+    seen.add(resolved);
+
+    let linkTarget: string;
+    try {
+      linkTarget = fs.readlinkSync(resolved);
+    } catch (e: unknown) {
+      throw new Error(
+        `Security violation: failed to read symbolic link '${resolved}': ${(e as { message?: string })?.message ?? String(e)}`,
+      );
+    }
+
+    const destination = path.isAbsolute(linkTarget)
+      ? path.resolve(linkTarget)
+      : path.resolve(path.dirname(resolved), linkTarget);
+
+    return getCanonicalPath(destination, hops + 1, seen);
+  }
+
+  // Not a symlink and exists on filesystem
+  try {
+    return fs.realpathSync(resolved);
+  } catch (err: unknown) {
+    const e = err as { code?: string; message?: string };
+    if (e && e.code === "ELOOP") {
+      throw new Error(
+        `Security violation: cyclic or excessively nested symbolic link detected in SQLite database path: '${targetPath}'`,
+      );
+    }
+    throw new Error(
+      `Security violation: unable to canonicalize path '${targetPath}': ${e.message ?? String(err)}`,
+    );
+  }
 }
 
 export function assertDatabasePathOutsideRepository(dbPath: string): void {
   if (dbPath === ":memory:") return;
+
   const resolvedDbPath = path.resolve(dbPath);
   const workspaceRoot = resolveWorkspaceRoot();
+
+  // 1. Lexical containment check
   if (
     resolvedDbPath === workspaceRoot ||
     resolvedDbPath.startsWith(`${workspaceRoot}${path.sep}`)
   ) {
     throw new Error(
       `Security violation: SQLite database path '${resolvedDbPath}' must reside outside the Git repository ('${workspaceRoot}'). Use ~/.local/share/priceradar/private-history.sqlite or a temporary directory outside the repository.`,
+    );
+  }
+
+  // 2. Canonical realpath containment check (prevents symlink / aliasing bypasses)
+  const canonicalDbPath = getCanonicalPath(resolvedDbPath);
+  const canonicalWorkspaceRoot = getCanonicalPath(workspaceRoot);
+
+  if (
+    canonicalDbPath === canonicalWorkspaceRoot ||
+    canonicalDbPath.startsWith(`${canonicalWorkspaceRoot}${path.sep}`)
+  ) {
+    throw new Error(
+      `Security violation: SQLite database path '${resolvedDbPath}' (canonical: '${canonicalDbPath}') resolves inside the Git repository ('${canonicalWorkspaceRoot}'). Use ~/.local/share/priceradar/private-history.sqlite or a temporary directory outside the repository.`,
     );
   }
 }
