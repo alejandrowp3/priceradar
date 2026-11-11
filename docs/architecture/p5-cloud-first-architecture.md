@@ -50,8 +50,9 @@ As clarified by the repository owner, **PriceRadar must be hosted in the cloud f
 - **Engine**: SQLite 3 with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`).
 - **Location**: `/data/private-history.sqlite` on a dedicated 5 GB persistent SSD volume mounted at `/data`.
 - **Repository Isolation**: `/data` is outside `/app` (the Git repository root), satisfying `assertDatabasePathOutsideRepository()`.
-- **Storage Readiness & Persistent Contract (`F7-08`, `F7-11`, `F7-11A`, `F7-11B`)**:
+- **Storage Readiness & Persistent Contract (`F7-08`, `F7-11`, `F7-11A`, `F7-11B`, `F7-12`)**:
   - The system explicitly distinguishes a writable filesystem from a verified persistent volume (`F7-11`). Dockerfile `VOLUME ["/data"]` alone is not proof of durable cloud storage.
+  - **Official Railway Runtime Detection (`F7-12`)**: Detects Railway deployment using standard platform-injected runtime variables: `RAILWAY_ENVIRONMENT_NAME`, `RAILWAY_ENVIRONMENT_ID`, `RAILWAY_SERVICE_ID`, `RAILWAY_VOLUME_NAME`, `RAILWAY_VOLUME_MOUNT_PATH`, and `RAILWAY_STATIC_URL`. Operators are never required to configure undocumented variables manually.
   - **Mount Path Validation (`F7-11A`)**: In Railway mode, `RAILWAY_VOLUME_MOUNT_PATH` (e.g. `/data`) is validated against the configured SQLite storage directory. The storage path must match or be contained within the platform-injected mount path. Arbitrary volume-name environment declarations without verified mount paths are rejected.
   - **CI Confinement (`F7-11A`)**: `PRICERADAR_PERSISTENCE_TIER="SIMULATED_CI_VOLUME"` is strictly restricted to automated CI and test environments (`CI=true` / `NODE_ENV=test`); setting this tier in cloud production fails closed.
   - **Platform Evidence vs. Restart Proof (`F7-11A`)**: The system distinguishes platform configuration evidence (`evidenceType: "RAILWAY_PLATFORM_MOUNT"`) from persistence verified by restart testing (`restartProofVerified: true`).

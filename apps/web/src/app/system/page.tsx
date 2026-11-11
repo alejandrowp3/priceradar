@@ -15,7 +15,12 @@ export default function SystemStatusPage() {
   const schedulerStatus = fetchSchedulerStatus();
 
   const isCloud =
-    process.env.NODE_ENV === "production" || Boolean(process.env.RAILWAY_ENVIRONMENT);
+    process.env.NODE_ENV === "production" ||
+    process.env.PRICERADAR_ENV === "cloud" ||
+    Boolean(process.env.RAILWAY_ENVIRONMENT_NAME) ||
+    Boolean(process.env.RAILWAY_ENVIRONMENT_ID) ||
+    Boolean(process.env.RAILWAY_SERVICE_ID) ||
+    Boolean(process.env.RAILWAY_ENVIRONMENT);
   const hasWebAuth = Boolean(process.env.PRICERADAR_WEB_PASSWORD);
   const allowedHosts =
     process.env.PRICERADAR_ALLOWED_HOSTS ?? "127.0.0.1, localhost (local mode)";

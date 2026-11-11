@@ -79,12 +79,14 @@ describe("Cloud Entrypoint Configuration Validation (F7-01 & F7-06)", () => {
       }).toThrow(/Storage configuration violation/);
     });
 
-    it("succeeds in cloud environment when attached Railway volume is configured", () => {
+    it("succeeds in realistic Railway environment using official runtime variables (F7-12)", () => {
       const config = validateCloudStartupConfig({
         HOST: "0.0.0.0",
         PRICERADAR_WEB_PASSWORD: "secure-password-123",
         PRICERADAR_ENV: "cloud",
-        RAILWAY_ENVIRONMENT: "production",
+        RAILWAY_ENVIRONMENT_NAME: "production",
+        RAILWAY_ENVIRONMENT_ID: "test-environment-id",
+        RAILWAY_SERVICE_ID: "test-service-id",
         RAILWAY_VOLUME_NAME: "priceradar-data",
         RAILWAY_VOLUME_MOUNT_PATH: "/tmp",
         PRICERADAR_SQLITE_PATH: "/tmp/private-history.sqlite",
@@ -92,6 +94,21 @@ describe("Cloud Entrypoint Configuration Validation (F7-01 & F7-06)", () => {
 
       expect(config.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
       expect(config.volumeMarker).toBeDefined();
+    });
+
+    it("fails closed in cloud environment when PRICERADAR_WEB_PASSWORD is missing even on loopback (F7-07, F7-12)", () => {
+      expect(() => {
+        validateCloudStartupConfig({
+          HOST: "127.0.0.1",
+          PRICERADAR_ENV: "cloud",
+          RAILWAY_ENVIRONMENT_NAME: "production",
+          RAILWAY_ENVIRONMENT_ID: "test-environment-id",
+          RAILWAY_SERVICE_ID: "test-service-id",
+          RAILWAY_VOLUME_NAME: "priceradar-data",
+          RAILWAY_VOLUME_MOUNT_PATH: "/tmp",
+          PRICERADAR_SQLITE_PATH: "/tmp/private-history.sqlite",
+        });
+      }).toThrow(/Security violation: PRICERADAR_WEB_PASSWORD must be configured/);
     });
 
     it("succeeds in CI environment when SIMULATED_CI_VOLUME is configured", () => {

@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   verifyStoragePersistenceContract,
+  isRailwayEnvironment,
+  isCloudDeployment,
   VOLUME_MARKER_FILENAME,
 } from "../src/storage-persistence.ts";
 
@@ -219,6 +221,45 @@ describe("Storage Persistence Contract Verification (F7-11, F7-11A, F7-11B)", ()
       expect(secondResult.restartProofVerified).toBe(true);
       expect(secondResult.volumeMarker?.volumeId).toBe(originalVolumeId);
       expect(secondResult.volumeMarker?.createdAt).toBe(originalCreatedAt);
+    });
+  });
+
+  describe("F7-12: Railway Official Runtime Environment Detection", () => {
+    it("detects Railway environment from official variables without RAILWAY_ENVIRONMENT", () => {
+      // 1. RAILWAY_ENVIRONMENT_NAME
+      expect(isRailwayEnvironment({ RAILWAY_ENVIRONMENT_NAME: "production" })).toBe(true);
+      // 2. RAILWAY_ENVIRONMENT_ID
+      expect(isRailwayEnvironment({ RAILWAY_ENVIRONMENT_ID: "env-uuid-123" })).toBe(true);
+      // 3. RAILWAY_SERVICE_ID
+      expect(isRailwayEnvironment({ RAILWAY_SERVICE_ID: "svc-uuid-456" })).toBe(true);
+      // 4. RAILWAY_VOLUME_NAME
+      expect(isRailwayEnvironment({ RAILWAY_VOLUME_NAME: "priceradar-data" })).toBe(true);
+      // 5. RAILWAY_VOLUME_MOUNT_PATH
+      expect(isRailwayEnvironment({ RAILWAY_VOLUME_MOUNT_PATH: "/data" })).toBe(true);
+      // 6. Negative case
+      expect(isRailwayEnvironment({})).toBe(false);
+      expect(isRailwayEnvironment({ NODE_ENV: "production" })).toBe(false);
+    });
+
+    it("detects cloud deployment from realistic Railway environment", () => {
+      const realisticEnv = {
+        PRICERADAR_ENV: "cloud",
+        RAILWAY_ENVIRONMENT_NAME: "production",
+        RAILWAY_ENVIRONMENT_ID: "env-uuid-123",
+        RAILWAY_SERVICE_ID: "svc-uuid-456",
+        RAILWAY_VOLUME_NAME: "priceradar-data",
+        RAILWAY_VOLUME_MOUNT_PATH: tempDir,
+      };
+
+      expect(isRailwayEnvironment(realisticEnv)).toBe(true);
+      expect(isCloudDeployment(realisticEnv)).toBe(true);
+
+      const result = verifyStoragePersistenceContract(tempDir, realisticEnv);
+      expect(result.persistenceVerified).toBe(true);
+      expect(result.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(result.evidenceType).toBe("RAILWAY_PLATFORM_MOUNT");
+      expect(result.volumeMarker?.volumeName).toBe("priceradar-data");
+      expect(result.volumeMarker?.hostEnvironment).toBe("railway:production");
     });
   });
 });

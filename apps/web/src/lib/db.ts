@@ -4,6 +4,7 @@ import {
   DEFAULT_PRIVATE_SQLITE_DB_PATH,
   SqlitePrivateHistoryRepository,
   verifyStoragePersistenceContract,
+  isCloudDeployment,
 } from "@priceradar/database";
 import type {
   CatalogCoverageReport,
@@ -202,11 +203,7 @@ export function checkSystemReadiness(
     };
   }
 
-  const isCloud =
-    env.PRICERADAR_ENV === "cloud" ||
-    Boolean(env.RAILWAY_ENVIRONMENT) ||
-    Boolean(env.RENDER) ||
-    Boolean(env.FLY_APP_NAME);
+  const isCloud = isCloudDeployment(env) || env.NODE_ENV === "production";
 
   if (isCloud) {
     const schedulerStatus = fetchSchedulerStatus({

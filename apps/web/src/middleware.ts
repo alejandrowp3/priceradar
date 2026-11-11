@@ -17,6 +17,12 @@ export function isCloudMode(): boolean {
   return (
     process.env.PRICERADAR_ENV === "cloud" ||
     process.env.NODE_ENV === "production" ||
+    Boolean(process.env.RAILWAY_ENVIRONMENT_NAME) ||
+    Boolean(process.env.RAILWAY_ENVIRONMENT_ID) ||
+    Boolean(process.env.RAILWAY_SERVICE_ID) ||
+    Boolean(process.env.RAILWAY_VOLUME_NAME) ||
+    Boolean(process.env.RAILWAY_VOLUME_MOUNT_PATH) ||
+    Boolean(process.env.RAILWAY_STATIC_URL) ||
     Boolean(process.env.RAILWAY_ENVIRONMENT) ||
     Boolean(process.env.RENDER) ||
     Boolean(process.env.FLY_APP_NAME)

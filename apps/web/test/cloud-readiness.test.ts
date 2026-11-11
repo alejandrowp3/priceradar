@@ -2,10 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { NextRequest } from "next/server";
 import { checkSystemReadiness, checkStorageReadiness } from "../src/lib/db";
 import { GET as healthRoute } from "../src/app/api/health/route";
 import { GET as telemetryRoute } from "../src/app/api/telemetry/route";
-import { SqlitePrivateHistoryRepository } from "@priceradar/database";
+import { middleware, isCloudMode } from "../src/middleware";
+import {
+  SqlitePrivateHistoryRepository,
+  isRailwayEnvironment,
+  isCloudDeployment,
+} from "@priceradar/database";
+import { validateCloudStartupConfig } from "../../worker/src/cloud-entrypoint";
 import type { DiscoveredListing } from "@priceradar/domain";
 import { createCopAmount } from "@priceradar/domain";
 
@@ -458,6 +465,136 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(reconnectedStorage.ready).toBe(true);
 
       repo2.close();
+    });
+  });
+
+  describe("F7-12: Realistic Railway Environment Compatibility & Fail-Closed Lifecycle", () => {
+    it("verifies realistic Railway environment detection, volume mounting, startup config, healthy scheduler, and fail-closed protections", async () => {
+      // 1. Realistic Railway environment object (F7-12 specification)
+      const realisticRailwayEnv: NodeJS.ProcessEnv = {
+        PRICERADAR_ENV: "cloud",
+        RAILWAY_ENVIRONMENT_NAME: "production",
+        RAILWAY_ENVIRONMENT_ID: "test-environment-id",
+        RAILWAY_SERVICE_ID: "test-service-id",
+        RAILWAY_VOLUME_NAME: "priceradar-data",
+        RAILWAY_VOLUME_MOUNT_PATH: tempDir,
+        PRICERADAR_SQLITE_PATH: path.join(tempDir, "private-history.sqlite"),
+        PRICERADAR_ALLOWED_HOSTS: "priceradar-production.up.railway.app",
+      };
+
+      // Expected 1: Cloud mode detected
+      expect(isRailwayEnvironment(realisticRailwayEnv)).toBe(true);
+      expect(isCloudDeployment(realisticRailwayEnv)).toBe(true);
+      Object.assign(process.env, realisticRailwayEnv);
+      expect(isCloudMode()).toBe(true);
+
+      // Expected 2: Valid mounted volume accepted
+      const storageResult = checkStorageReadiness({ env: realisticRailwayEnv });
+      expect(storageResult.ready).toBe(true);
+      expect(storageResult.persistenceVerified).toBe(true);
+      expect(storageResult.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(storageResult.evidenceType).toBe("RAILWAY_PLATFORM_MOUNT");
+      expect(storageResult.volumeMarker?.volumeName).toBe("priceradar-data");
+      expect(storageResult.volumeMarker?.hostEnvironment).toBe("railway:production");
+
+      // Expected 3: Cloud startup configuration accepted
+      const startupConfig = validateCloudStartupConfig({
+        ...realisticRailwayEnv,
+        PRICERADAR_WEB_PASSWORD: "SuperSecureCloudPassword2026!",
+      });
+      expect(startupConfig.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(startupConfig.isLoopback).toBe(false);
+      expect(startupConfig.webPassword).toBe("SuperSecureCloudPassword2026!");
+
+      // Expected 4: Healthy scheduler produces HTTP 200
+      const now = Date.now();
+      fs.writeFileSync(
+        statusFilePath,
+        JSON.stringify({
+          isRunning: true,
+          totalScansExecuted: 5,
+          lastHeartbeatAt: new Date(now - 5000).toISOString(),
+          intervalMinutes: 60,
+          consecutiveErrors: 0,
+        }),
+        "utf-8",
+      );
+      const systemResult = checkSystemReadiness({ env: realisticRailwayEnv, nowMs: now });
+      expect(systemResult.ready).toBe(true);
+      expect(systemResult.schedulerReady).toBe(true);
+      const healthResponse = await healthRoute();
+      expect(healthResponse.status).toBe(200);
+      const healthJson = await healthResponse.json();
+      expect(healthJson).toEqual({ status: "healthy", ready: true });
+
+      // Expected 5: Missing or mismatched volume fails closed
+      // 5a. Missing RAILWAY_VOLUME_MOUNT_PATH
+      const missingMountEnv: NodeJS.ProcessEnv = {
+        ...realisticRailwayEnv,
+      };
+      delete missingMountEnv.RAILWAY_VOLUME_MOUNT_PATH;
+      const missingMountStorage = checkStorageReadiness({ env: missingMountEnv });
+      expect(missingMountStorage.ready).toBe(false);
+      expect(missingMountStorage.persistenceVerified).toBe(false);
+      expect(missingMountStorage.reason).toContain("RAILWAY_VOLUME_MOUNT_PATH");
+      expect(() => {
+        validateCloudStartupConfig({
+          ...missingMountEnv,
+          PRICERADAR_WEB_PASSWORD: "SuperSecureCloudPassword2026!",
+        });
+      }).toThrow(/Storage configuration violation/);
+      Object.assign(process.env, missingMountEnv);
+      delete process.env.RAILWAY_VOLUME_MOUNT_PATH;
+      delete process.env.PRICERADAR_VOLUME_MOUNT_PATH;
+      const missingMountHealth = await healthRoute();
+      expect(missingMountHealth.status).toBe(503);
+
+      // 5b. Mismatched RAILWAY_VOLUME_MOUNT_PATH
+      const mismatchedMountEnv: NodeJS.ProcessEnv = {
+        ...realisticRailwayEnv,
+        RAILWAY_VOLUME_MOUNT_PATH: "/other-volume-mount",
+      };
+      const mismatchedStorage = checkStorageReadiness({ env: mismatchedMountEnv });
+      expect(mismatchedStorage.ready).toBe(false);
+      expect(mismatchedStorage.persistenceVerified).toBe(false);
+      expect(mismatchedStorage.reason).toContain(
+        "does not reside within Railway volume mount path",
+      );
+      expect(() => {
+        validateCloudStartupConfig({
+          ...mismatchedMountEnv,
+          PRICERADAR_WEB_PASSWORD: "SuperSecureCloudPassword2026!",
+        });
+      }).toThrow(/Storage configuration violation/);
+      Object.assign(process.env, mismatchedMountEnv);
+      const mismatchedHealth = await healthRoute();
+      expect(mismatchedHealth.status).toBe(503);
+
+      // Expected 6: Missing dashboard password fails closed
+      const missingPasswordEnv: NodeJS.ProcessEnv = {
+        ...realisticRailwayEnv,
+        PRICERADAR_WEB_PASSWORD: "",
+      };
+      delete missingPasswordEnv.PRICERADAR_WEB_PASSWORD;
+      expect(() => {
+        validateCloudStartupConfig(missingPasswordEnv);
+      }).toThrow(/Security violation: PRICERADAR_WEB_PASSWORD must be configured/);
+
+      // Middleware fails closed on remote request without credentials
+      Object.assign(process.env, missingPasswordEnv);
+      const unauthReq = new NextRequest(
+        "https://priceradar-production.up.railway.app/products",
+        { headers: { host: "priceradar-production.up.railway.app" } },
+      );
+      const unauthRes = middleware(unauthReq);
+      expect(unauthRes.status).toBe(401);
+
+      // Even if client attempts to forge loopback Host header in cloud mode, it fails closed (401/403)
+      const forgedReq = new NextRequest("http://localhost:4178/products", {
+        headers: { host: "localhost:4178" },
+      });
+      const forgedRes = middleware(forgedReq);
+      expect([401, 403]).toContain(forgedRes.status);
     });
   });
 });

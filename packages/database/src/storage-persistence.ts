@@ -46,7 +46,43 @@ function isStorageContainedInMount(storageDir: string, mountPath: string): boole
 }
 
 /**
- * Validates the persistent storage contract for cloud deployments (`F7-11`, `F7-11A`, `F7-11B`).
+ * Detects whether the process is executing inside a Railway deployment (`F7-12`).
+ * Railway automatically provides runtime environment variables:
+ * - RAILWAY_ENVIRONMENT_NAME (e.g. 'production', 'staging')
+ * - RAILWAY_ENVIRONMENT_ID
+ * - RAILWAY_SERVICE_ID
+ * - RAILWAY_VOLUME_NAME
+ * - RAILWAY_VOLUME_MOUNT_PATH
+ * - RAILWAY_STATIC_URL
+ *
+ * We also accept RAILWAY_ENVIRONMENT for backward compatibility, but never require users to set it.
+ */
+export function isRailwayEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    env.RAILWAY_ENVIRONMENT_NAME ||
+    env.RAILWAY_ENVIRONMENT_ID ||
+    env.RAILWAY_SERVICE_ID ||
+    env.RAILWAY_VOLUME_NAME ||
+    env.RAILWAY_VOLUME_MOUNT_PATH ||
+    env.RAILWAY_STATIC_URL ||
+    env.RAILWAY_ENVIRONMENT,
+  );
+}
+
+/**
+ * Detects whether the current process is executing in a cloud environment (`F7-12`).
+ */
+export function isCloudDeployment(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    env.PRICERADAR_ENV === "cloud" ||
+    isRailwayEnvironment(env) ||
+    Boolean(env.RENDER) ||
+    Boolean(env.FLY_APP_NAME)
+  );
+}
+
+/**
+ * Validates the persistent storage contract for cloud deployments (`F7-11`, `F7-11A`, `F7-11B`, `F7-12`).
  * Explicitly distinguishes a writable filesystem from a verified persistent volume:
  * - Writable /data in a container without an attached volume is ephemeral and rejected in cloud mode.
  * - Railway persistent volumes require valid mount path validation (RAILWAY_VOLUME_MOUNT_PATH matching storageDir).
@@ -55,6 +91,7 @@ function isStorageContainedInMount(storageDir: string, mountPath: string): boole
  * - Marker writes must fail closed upon failure (F7-11B).
  * - Existing markers are strictly validated before trust; corrupted or incomplete markers fail closed (F7-11B).
  * - Known volume identities are never silently replaced (F7-11B).
+ * - Automatically detects standard Railway runtime variables (F7-12).
  */
 export function verifyStoragePersistenceContract(
   storageDir: string,
@@ -101,11 +138,7 @@ export function verifyStoragePersistenceContract(
     };
   }
 
-  const isCloud =
-    env.PRICERADAR_ENV === "cloud" ||
-    Boolean(env.RAILWAY_ENVIRONMENT) ||
-    Boolean(env.RENDER) ||
-    Boolean(env.FLY_APP_NAME);
+  const isCloud = isCloudDeployment(env);
 
   let persistenceTier: PersistenceTier;
   let evidenceType: PersistenceEvidenceType = "NONE";
@@ -143,8 +176,8 @@ export function verifyStoragePersistenceContract(
     evidenceType = "CI_SIMULATED_TEST_MOUNT";
     persistenceVerified = true;
     volumeName = "simulated-ci-volume";
-  } else if (env.RAILWAY_ENVIRONMENT) {
-    // 3. F7-11A: Railway deployment validation against platform-reported mount path
+  } else if (isRailwayEnvironment(env)) {
+    // 3. F7-11A, F7-12: Railway deployment validation against platform-reported mount path
     const reportedMountPath =
       env.RAILWAY_VOLUME_MOUNT_PATH ?? env.PRICERADAR_VOLUME_MOUNT_PATH;
     const reportedVolumeName = env.RAILWAY_VOLUME_NAME ?? env.PRICERADAR_VOLUME_NAME;
@@ -230,7 +263,7 @@ export function verifyStoragePersistenceContract(
       volumeMarker: null,
       isExistingMarker: false,
       restartProofVerified: false,
-      reason: env.RAILWAY_ENVIRONMENT
+      reason: isRailwayEnvironment(env)
         ? `Railway deployment detected without attached persistent volume. Step 2 (Attach Volume at /data) in the Cloud Deployment Guide is required to guarantee durable price history.`
         : `Cloud deployment requires verified persistent volume with valid mount path. Ephemeral container filesystem rejected to prevent data loss.`,
     };
@@ -306,8 +339,10 @@ export function verifyStoragePersistenceContract(
     storagePath: resolvedDir,
     ...(volumeName ? { volumeName } : {}),
     ...(mountPath ? { mountPath } : {}),
-    ...(env.RAILWAY_ENVIRONMENT
-      ? { hostEnvironment: `railway:${env.RAILWAY_ENVIRONMENT}` }
+    ...(isRailwayEnvironment(env)
+      ? {
+          hostEnvironment: `railway:${env.RAILWAY_ENVIRONMENT_NAME ?? env.RAILWAY_ENVIRONMENT ?? env.RAILWAY_ENVIRONMENT_ID ?? "production"}`,
+        }
       : {}),
   };
 

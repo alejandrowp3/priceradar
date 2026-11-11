@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { verifyStoragePersistenceContract } from "@priceradar/database";
+import {
+  verifyStoragePersistenceContract,
+  isCloudDeployment,
+} from "@priceradar/database";
 import type { PersistenceTier, VolumeMarkerInfo } from "@priceradar/database";
 import { CloudScheduler } from "./cloud-scheduler.ts";
 
@@ -34,21 +37,17 @@ export function validateCloudStartupConfig(env: NodeJS.ProcessEnv): CloudStartup
 
   const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
 
-  if (!isLoopback && (!webPassword || webPassword.length === 0)) {
+  const isCloud = isCloudDeployment(env) || env.NODE_ENV === "production";
+
+  if ((!isLoopback || isCloud) && (!webPassword || webPassword.length === 0)) {
     throw new Error(
-      `Security violation: PRICERADAR_WEB_PASSWORD must be configured when binding to non-loopback host '${host}'. Passwordless mode is restricted strictly to local loopback (127.0.0.1 / localhost).`,
+      `Security violation: PRICERADAR_WEB_PASSWORD must be configured when binding to non-loopback host '${host}' or operating in cloud mode. Passwordless mode is restricted strictly to local loopback (127.0.0.1 / localhost) in local development.`,
     );
   }
 
   // F7-11: Validate persistent storage contract before launching cloud workers
   const storageDir = path.dirname(path.resolve(sqlitePath));
   const persistenceResult = verifyStoragePersistenceContract(storageDir, env);
-
-  const isCloud =
-    env.PRICERADAR_ENV === "cloud" ||
-    Boolean(env.RAILWAY_ENVIRONMENT) ||
-    Boolean(env.RENDER) ||
-    Boolean(env.FLY_APP_NAME);
 
   if (isCloud && !persistenceResult.persistenceVerified) {
     throw new Error(

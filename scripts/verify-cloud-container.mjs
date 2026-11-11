@@ -165,6 +165,13 @@ if (fs.existsSync(storagePersistencePath)) {
       content.includes("isStorageContainedInMount"),
   );
   assertCondition(
+    "Storage persistence detects standard Railway runtime variables without requiring undocumented config (F7-12)",
+    content.includes("isRailwayEnvironment") &&
+      content.includes("RAILWAY_ENVIRONMENT_NAME") &&
+      content.includes("RAILWAY_ENVIRONMENT_ID") &&
+      content.includes("RAILWAY_SERVICE_ID"),
+  );
+  assertCondition(
     "Storage persistence restricts SIMULATED_CI_VOLUME strictly to CI/test (F7-11A)",
     content.includes('env.CI === "true"') &&
       content.includes("SIMULATED_CI_VOLUME persistence tier is strictly restricted"),

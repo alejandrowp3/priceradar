@@ -31,7 +31,7 @@ This guide describes how to deploy PriceRadar to **Railway** in under 5 minutes 
    ```
 5. Set the size to **5 GB** (SSD).
 6. Click **Save**.
-7. _(Note: PriceRadar automatically verifies the persistent volume contract via Railway-injected environment variables `RAILWAY_VOLUME_NAME` or `RAILWAY_VOLUME_MOUNT_PATH`. If a cloud deployment runs without an attached volume, startup and health probes will fail closed with HTTP 503 to prevent data loss on container replacement.)_
+7. _(Note: PriceRadar automatically verifies the persistent volume contract via Railway-injected environment variables `RAILWAY_VOLUME_NAME` and `RAILWAY_VOLUME_MOUNT_PATH`, and detects the platform via `RAILWAY_ENVIRONMENT_NAME`, `RAILWAY_ENVIRONMENT_ID`, or `RAILWAY_SERVICE_ID` (`F7-12`). If a cloud deployment runs without an attached volume, startup and health probes will fail closed with HTTP 503 to prevent data loss on container replacement.)_
 
 ---
 
@@ -51,7 +51,7 @@ In the **Variables** tab of your service, add the following variables:
 | `PRICERADAR_AUTH_SECRET`               | `<random-64-character-hex>`      | Cryptographic secret for session authorization |
 | `PRICERADAR_HMAC_SECRET`               | `<random-64-character-hex>`      | Fulfillment context HMAC hashing secret        |
 
-_(Railway automatically provides `PORT` and routes public traffic to it)._
+_(Railway automatically injects `PORT`, `RAILWAY_ENVIRONMENT_NAME`, `RAILWAY_ENVIRONMENT_ID`, `RAILWAY_SERVICE_ID`, `RAILWAY_VOLUME_NAME`, and `RAILWAY_VOLUME_MOUNT_PATH`; no undocumented platform variables need to be configured manually)._
 
 ---
 
