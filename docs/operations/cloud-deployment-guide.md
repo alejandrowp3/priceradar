@@ -65,20 +65,20 @@ _(Railway automatically provides `PORT` and routes public traffic to it)._
 ## Step 5: Verify Cloud Deployment
 
 1. Open `https://<your-railway-domain>/api/health` in your browser:
-   - Should return HTTP 200 OK with:
+   - Should return HTTP 200 OK (minimal unauthenticated readiness probe, zero internal paths or timestamps leaked):
      ```json
      {
        "status": "healthy",
-       "service": "priceradar-cloud",
-       "database": { "connected": true, "path": "/data/private-history.sqlite" },
-       "scheduler": { "active": true, "lastScanStatus": "SUCCEEDED" }
+       "ready": true
      }
      ```
 2. Open `https://<your-railway-domain>/`:
-   - Enter your `PRICERADAR_WEB_PASSWORD` when prompted by the browser.
-   - The Overview dashboard renders with real-time statistics from the initial collection run.
+   - Enter your `PRICERADAR_WEB_PASSWORD` when prompted by the browser (HTTP Basic Auth).
+   - The Overview dashboard renders with real-time statistics from the initial collection run. Synthetic data is clearly labeled with `[DEMO SINTÉTICO]`.
 3. Open `https://<your-railway-domain>/system`:
    - View the live infrastructure telemetry, scheduler state, and the audit table of recent scan runs.
+4. (Optional) Inspect authenticated telemetry at `https://<your-railway-domain>/api/telemetry`:
+   - Returns detailed operational and scheduler metrics protected behind mandatory authentication.
 
 ---
 

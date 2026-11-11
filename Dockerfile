@@ -10,7 +10,7 @@ FROM node:24-bookworm-slim AS base
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Install required system libraries for headless Chromium and corepack
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # -----------------------------------------------------------------------------
-# Build Stage: Install dependencies and compile workspace packages & Next.js
+# Build Stage: Install dependencies, download Chromium, and compile packages & Next.js
 # -----------------------------------------------------------------------------
 FROM base AS builder
 
@@ -52,6 +52,9 @@ COPY apps/web/package.json ./apps/web/
 COPY apps/worker/package.json ./apps/worker/
 
 RUN pnpm install --frozen-lockfile
+
+# F7-04: Install Playwright Chromium in cloud container build
+RUN npx playwright install chromium
 
 COPY packages ./packages
 COPY apps ./apps
@@ -70,12 +73,17 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PRICERADAR_ENV=cloud
 ENV PRICERADAR_SQLITE_PATH=/data/private-history.sqlite
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PORT=4178
 ENV HOST=0.0.0.0
 
 # Create persistent storage mount directory
-RUN mkdir -p /data
+RUN mkdir -p /data /ms-playwright
 
+# Copy installed Chromium browser binaries (F7-04)
+COPY --from=builder /ms-playwright /ms-playwright
+
+# Copy compiled application code and workspace
 COPY --from=builder /app /app
 
 VOLUME ["/data"]

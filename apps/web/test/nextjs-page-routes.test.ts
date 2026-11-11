@@ -15,6 +15,7 @@ import CoveragePage from "../src/app/coverage/page";
 import ProductDetailPage from "../src/app/products/[id]/page";
 import SystemStatusPage from "../src/app/system/page";
 import { GET as healthRoute } from "../src/app/api/health/route";
+import { GET as telemetryRoute } from "../src/app/api/telemetry/route";
 
 const VALID_CTX_HASH = "ctx-88be5762563932c5";
 
@@ -300,13 +301,27 @@ describe("Next.js Server Component Route Execution (P4 Runtime Fix)", () => {
       expect(page).toBeDefined();
     });
 
-    it("responds with HTTP 200 and JSON payload on /api/health", async () => {
+    it("responds with minimal non-leaking HTTP 200 payload on public /api/health (F7-02)", async () => {
       const response = await healthRoute();
       expect(response.status).toBe(200);
       const json = await response.json();
-      expect(json.status).toBe("healthy");
+      expect(json).toEqual({
+        status: "healthy",
+        ready: true,
+      });
+      // Guarantees zero sensitive metadata or paths leaked on public endpoint
+      expect(json.database).toBeUndefined();
+      expect(json.dbPath).toBeUndefined();
+      expect(json.scheduler).toBeUndefined();
+    });
+
+    it("responds with detailed operational telemetry on private /api/telemetry (F7-02)", async () => {
+      const response = await telemetryRoute();
+      expect(response.status).toBe(200);
+      const json = await response.json();
+      expect(json.service).toBe("priceradar-cloud");
       expect(json.database.connected).toBe(true);
-      expect(json.scheduler).toBeDefined();
+      expect(json.recentExecutionsCount).toBeDefined();
     });
   });
 });

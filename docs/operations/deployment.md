@@ -20,7 +20,7 @@ Local Docker installations, local background workers, and keeping the owner's pe
 | **Private Web Dashboard**         | Next.js 15 (App Router)                                        | Hosted on managed HTTPS domain. Secured via HTTP Basic Auth (`PRICERADAR_WEB_PASSWORD`) and DNS rebinding protections. |
 | **Background Scheduler & Worker** | In-Process Cloud Worker (`apps/worker/src/cloud-scheduler.ts`) | Periodic automated collection every 60 min. Runs deterministic test collector (`fixture-colombia`) in Milestone 1.     |
 | **Persistent Storage**            | Persistent SSD Volume (`/data`)                                | Durable SQLite 3 database in WAL mode (`/data/private-history.sqlite`), isolated outside Git repository.               |
-| **Platform Health Check**         | `/api/health`                                                  | Automated container orchestrator probe returning structured health status.                                             |
+| **Platform Health Check**         | `/api/health` & `/api/telemetry`                               | Minimal public readiness probe (`/api/health`) and authenticated operational telemetry (`/api/telemetry`).             |
 | **Estimated Monthly Cost**        | ~$8.00 – $12.00 / month                                        | Usage-based compute + 5 GB SSD persistent volume.                                                                      |
 
 ---

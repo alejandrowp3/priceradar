@@ -30,6 +30,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:runtime": "node --experimental-strip-types scripts/verify-dashboard-runtime.mjs",
+    "verify:container": "node scripts/verify-cloud-container.mjs",
     "test:e2e": "node scripts/check-port.mjs && playwright test"
   },
   "devDependencies": {

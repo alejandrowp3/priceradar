@@ -244,7 +244,11 @@ export type GeographicVerificationVerdictType =
   | "UNVERIFIED_STATIC_SEO_PRICING"
   | "UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION"
   | "UNVERIFIED_MISSING_HMAC_SECRET"
-  | "UNVERIFIED_NO_ACTIVE_ADDRESS";
+  | "UNVERIFIED_NO_ACTIVE_ADDRESS"
+  | "UNVERIFIED_DEMO_FIXTURE";
+
+export type ObservationProvenanceType =
+  "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE" | "DEMO_FIXTURE";
 
 export type OpportunityLifecycleStatus =
   "ACTIVE" | "SUPERSEDED" | "EXPIRED" | "DISMISSED";
@@ -277,6 +281,7 @@ export interface SupervisedPersistenceContextInput {
   readonly duplicateSuppressedCount: number;
   readonly listings: readonly DiscoveredListing[];
   readonly sourceView?: SourceViewDescriptor;
+  readonly isDemoFixture?: boolean;
 }
 
 export interface BatchPreviewItem {
@@ -292,7 +297,7 @@ export interface BatchPreviewSummary {
   readonly storeId?: string;
   readonly storeName?: string;
   readonly fulfillmentContextId?: string;
-  readonly provenance?: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+  readonly provenance?: ObservationProvenanceType;
   readonly geographicVerificationVerdict: GeographicVerificationVerdictType;
   readonly addressSpecificPricingVerified: boolean;
   readonly candidatesDiscoveredCount: number;
@@ -441,7 +446,7 @@ export interface PersistedProductObservationHistoryRow {
   readonly declaredReferencePriceCop?: CopAmount;
   readonly availability: AvailabilityStatus;
   readonly observedAt: string;
-  readonly provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+  readonly provenance: ObservationProvenanceType;
   readonly geographicVerificationVerdict: GeographicVerificationVerdictType;
   readonly servingBranchEvidence: string;
   readonly catalogContextEvidence: string;
@@ -475,7 +480,7 @@ export interface PersistedOpportunityEventRow {
   readonly historicalMedianCop: CopAmount;
   readonly confidence: ConfidenceLevel;
   readonly requiresVerification: boolean;
-  readonly provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+  readonly provenance: ObservationProvenanceType;
   readonly geographicVerificationVerdict: GeographicVerificationVerdictType;
   readonly rationaleEsCo: string;
   readonly detectedAt: string;
@@ -817,7 +822,7 @@ CREATE TABLE IF NOT EXISTS fulfillment_contexts (
   verified_city_slug TEXT,
   verified_city_name TEXT,
   context_verification_status TEXT NOT NULL CHECK (
-    context_verification_status IN ('PROVISIONAL_SESSION_CONTEXT', 'VERIFIED_ADDRESS_CONTEXT')
+    context_verification_status IN ('PROVISIONAL_SESSION_CONTEXT', 'VERIFIED_ADDRESS_CONTEXT', 'SYNTHETIC_DEMO_CONTEXT')
   ),
   active_address_evidence TEXT NOT NULL,
   city_metadata_evidence TEXT NOT NULL,
@@ -826,7 +831,8 @@ CREATE TABLE IF NOT EXISTS fulfillment_contexts (
   pricing_verification_verdict TEXT NOT NULL CHECK (
     pricing_verification_verdict IN (
       'VERIFIED_ADDRESS_SPECIFIC_PRICING',
-      'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION'
+      'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION',
+      'UNVERIFIED_DEMO_FIXTURE'
     )
   ),
   first_seen_at TEXT NOT NULL,
@@ -835,6 +841,8 @@ CREATE TABLE IF NOT EXISTS fulfillment_contexts (
     (context_verification_status = 'PROVISIONAL_SESSION_CONTEXT' AND pricing_verification_verdict != 'VERIFIED_ADDRESS_SPECIFIC_PRICING')
     OR
     (context_verification_status = 'VERIFIED_ADDRESS_CONTEXT' AND pricing_verification_verdict = 'VERIFIED_ADDRESS_SPECIFIC_PRICING')
+    OR
+    (context_verification_status = 'SYNTHETIC_DEMO_CONTEXT' AND pricing_verification_verdict = 'UNVERIFIED_DEMO_FIXTURE')
   )
 );
 
@@ -876,12 +884,13 @@ CREATE TABLE IF NOT EXISTS price_observations (
   ),
   observed_at TEXT NOT NULL,
   provenance TEXT NOT NULL CHECK (
-    provenance IN ('PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL', 'LIVE_PRIVATE')
+    provenance IN ('PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL', 'LIVE_PRIVATE', 'DEMO_FIXTURE')
   ),
   geographic_verification_verdict TEXT NOT NULL CHECK (
     geographic_verification_verdict IN (
       'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION',
-      'VERIFIED_ADDRESS_SPECIFIC_PRICING'
+      'VERIFIED_ADDRESS_SPECIFIC_PRICING',
+      'UNVERIFIED_DEMO_FIXTURE'
     )
   ),
   serving_branch_evidence TEXT NOT NULL,
@@ -895,6 +904,8 @@ CREATE TABLE IF NOT EXISTS price_observations (
     (provenance = 'PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL' AND address_specific_pricing_verified = 0 AND geographic_verification_verdict = 'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION')
     OR
     (provenance = 'LIVE_PRIVATE' AND address_specific_pricing_verified = 1 AND geographic_verification_verdict = 'VERIFIED_ADDRESS_SPECIFIC_PRICING')
+    OR
+    (provenance = 'DEMO_FIXTURE' AND address_specific_pricing_verified = 0 AND geographic_verification_verdict = 'UNVERIFIED_DEMO_FIXTURE')
   )
 );
 
@@ -931,12 +942,13 @@ CREATE TABLE IF NOT EXISTS opportunity_events (
   confidence TEXT NOT NULL CHECK (confidence IN ('LOW', 'MEDIUM', 'HIGH')),
   requires_verification INTEGER NOT NULL CHECK (requires_verification IN (0, 1)),
   provenance TEXT NOT NULL CHECK (
-    provenance IN ('PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL', 'LIVE_PRIVATE')
+    provenance IN ('PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL', 'LIVE_PRIVATE', 'DEMO_FIXTURE')
   ),
   geographic_verification_verdict TEXT NOT NULL CHECK (
     geographic_verification_verdict IN (
       'UNVERIFIED_BRANCH_OR_CATALOG_ASSOCIATION',
-      'VERIFIED_ADDRESS_SPECIFIC_PRICING'
+      'VERIFIED_ADDRESS_SPECIFIC_PRICING',
+      'UNVERIFIED_DEMO_FIXTURE'
     )
   ),
   rationale_es_co TEXT NOT NULL,
@@ -951,6 +963,13 @@ CREATE INDEX IF NOT EXISTS idx_opportunity_events_listing
 
 CREATE INDEX IF NOT EXISTS idx_opportunity_events_type
   ON opportunity_events(opportunity_type, lifecycle_status, discount_basis_points DESC);
+
+CREATE TABLE IF NOT EXISTS worker_locks (
+  lock_key TEXT PRIMARY KEY,
+  holder_id TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
 `;
 
 /**
@@ -975,10 +994,33 @@ export function evaluateBatchPersistenceEligibility(
 ): {
   readonly isEligible: boolean;
   readonly rejectionReason?: string;
-  readonly effectiveProvenance?:
-    "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+  readonly effectiveProvenance?: ObservationProvenanceType;
   readonly effectiveVerdict: GeographicVerificationVerdictType;
 } {
+  const isDemoFixture =
+    context.isDemoFixture === true ||
+    context.listings.some(
+      (l) =>
+        (l as { provenance?: string }).provenance === "DEMO_FIXTURE" ||
+        l.providerId === "fixture-colombia",
+    );
+
+  if (isDemoFixture) {
+    if (context.listings.length === 0) {
+      return {
+        isEligible: false,
+        rejectionReason:
+          "No se encontraron productos válidos con identificador, nombre y precio entero en COP.",
+        effectiveVerdict: "UNVERIFIED_DEMO_FIXTURE",
+      };
+    }
+    return {
+      isEligible: true,
+      effectiveProvenance: "DEMO_FIXTURE",
+      effectiveVerdict: "UNVERIFIED_DEMO_FIXTURE",
+    };
+  }
+
   if (
     context.hasSecurityChallenge === true ||
     context.gateStatus === "CHALLENGE_DETECTED"
@@ -1082,7 +1124,7 @@ export function evaluateBatchPersistenceEligibility(
  */
 export function computeScanBatchFingerprint(
   context: SupervisedPersistenceContextInput,
-  effectiveProvenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE",
+  effectiveProvenance: ObservationProvenanceType,
   effectiveVerdict: GeographicVerificationVerdictType,
 ): string {
   const canonicalListings = context.listings
@@ -1332,6 +1374,61 @@ export class SqlitePrivateHistoryRepository {
       CREATE INDEX IF NOT EXISTS idx_scan_run_products_product
         ON scan_run_products(product_variant_key);
     `);
+  }
+
+  /**
+   * Acquires a distributed SQLite worker lease lock (`F7-06`).
+   * Atomically expires stale locks and inserts the new lease.
+   * Returns true if lock was successfully acquired, false if held by another active worker.
+   */
+  public acquireWorkerLock(
+    lockKey: string,
+    holderId: string,
+    ttlMs: number,
+    nowIso: string = new Date().toISOString(),
+  ): boolean {
+    this.assertWritable("acquireWorkerLock");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS worker_locks (
+        lock_key TEXT PRIMARY KEY,
+        holder_id TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+    `);
+
+    this.db
+      .prepare("DELETE FROM worker_locks WHERE lock_key = ? AND expires_at <= ?")
+      .run(lockKey, nowIso);
+
+    const nowMs = Date.parse(nowIso);
+    const expiresAtIso = new Date(nowMs + ttlMs).toISOString();
+
+    try {
+      const res = this.db
+        .prepare(
+          "INSERT INTO worker_locks (lock_key, holder_id, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
+        )
+        .run(lockKey, holderId, nowIso, expiresAtIso);
+      return Number(res.changes) > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Releases a distributed SQLite worker lease lock (`F7-06`).
+   */
+  public releaseWorkerLock(lockKey: string, holderId: string): boolean {
+    this.assertWritable("releaseWorkerLock");
+    try {
+      const res = this.db
+        .prepare("DELETE FROM worker_locks WHERE lock_key = ? AND holder_id = ?")
+        .run(lockKey, holderId);
+      return Number(res.changes) > 0;
+    } catch {
+      return false;
+    }
   }
 
   public withImmediateTransaction<T>(fn: () => T): T {
@@ -1870,7 +1967,9 @@ export class SqlitePrivateHistoryRepository {
         const contextVerificationStatus =
           effectiveProvenance === "LIVE_PRIVATE"
             ? "VERIFIED_ADDRESS_CONTEXT"
-            : "PROVISIONAL_SESSION_CONTEXT";
+            : effectiveProvenance === "DEMO_FIXTURE"
+              ? "SYNTHETIC_DEMO_CONTEXT"
+              : "PROVISIONAL_SESSION_CONTEXT";
 
         this.db
           .prepare(
@@ -2462,7 +2561,7 @@ export class SqlitePrivateHistoryRepository {
               .all()
       ) as Array<{
         listing_key: string;
-        provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+        provenance: ObservationProvenanceType;
       }>;
 
       const latestObsStmt = this.db.prepare(
@@ -2560,7 +2659,7 @@ export class SqlitePrivateHistoryRepository {
               declared_reference_price_cop: number | null;
               availability: AvailabilityStatus;
               observed_at: string;
-              provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+              provenance: ObservationProvenanceType;
               geographic_verification_verdict: GeographicVerificationVerdictType;
               provider_id: string;
               external_product_id: string;
@@ -3248,7 +3347,7 @@ export class SqlitePrivateHistoryRepository {
       declared_reference_price_cop: number | null;
       availability: AvailabilityStatus;
       observed_at: string;
-      provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+      provenance: ObservationProvenanceType;
       geographic_verification_verdict: GeographicVerificationVerdictType;
       serving_branch_evidence: string;
       catalog_context_evidence: string;
@@ -3381,7 +3480,7 @@ export class SqlitePrivateHistoryRepository {
       historical_median_cop: number;
       confidence: ConfidenceLevel;
       requires_verification: number;
-      provenance: "PRIVATE_AUTHENTICATED_SESSION_PROVISIONAL" | "LIVE_PRIVATE";
+      provenance: ObservationProvenanceType;
       geographic_verification_verdict: GeographicVerificationVerdictType;
       rationale_es_co: string;
       detected_at: string;
@@ -3623,6 +3722,7 @@ export class SqlitePrivateHistoryRepository {
           o.observed_at,
           o.store_key,
           o.scan_run_id,
+          o.provenance,
           ROW_NUMBER() OVER (
             PARTITION BY o.product_variant_key
             ORDER BY o.observed_at DESC, o.observation_id DESC
@@ -3672,6 +3772,7 @@ export class SqlitePrivateHistoryRepository {
       ${baseCte}
       SELECT
         p.product_variant_key,
+        p.provider_id,
         p.external_product_id,
         p.external_variant_id,
         p.product_name,
@@ -3687,6 +3788,7 @@ export class SqlitePrivateHistoryRepository {
         s.external_store_id,
         latest.observed_price_cop as latest_price,
         latest.observed_at as latest_observed_at,
+        latest.provenance as latest_provenance,
         prev.observed_price_cop as prev_price,
         stats.total_obs,
         sr.source_view_key,
@@ -3735,6 +3837,7 @@ export class SqlitePrivateHistoryRepository {
       .prepare(selectSql)
       .all(...whereParams, pageSize, offset) as Array<{
       product_variant_key: string;
+      provider_id: string;
       external_product_id: string;
       external_variant_id: string;
       product_name: string;
@@ -3750,6 +3853,7 @@ export class SqlitePrivateHistoryRepository {
       external_store_id: string;
       latest_price: number;
       latest_observed_at: string;
+      latest_provenance: string;
       prev_price: number | null;
       total_obs: number;
       source_view_key: string | null;
@@ -3804,6 +3908,8 @@ export class SqlitePrivateHistoryRepository {
         ...(r.source_view_label !== null
           ? { latestSourceViewLabel: r.source_view_label }
           : {}),
+        isSyntheticDemo:
+          r.provider_id === "fixture-colombia" || r.latest_provenance === "DEMO_FIXTURE",
         ...(r.opp_id !== null &&
         r.opp_type !== null &&
         r.opp_label !== null &&
@@ -3845,6 +3951,7 @@ export class SqlitePrivateHistoryRepository {
       .prepare(
         `SELECT
           p.product_variant_key,
+          p.provider_id,
           p.external_product_id,
           p.external_variant_id,
           p.product_name,
@@ -3868,6 +3975,7 @@ export class SqlitePrivateHistoryRepository {
       .get(trimmed) as
       | {
           product_variant_key: string;
+          provider_id: string;
           external_product_id: string;
           external_variant_id: string;
           product_name: string;
@@ -3897,6 +4005,7 @@ export class SqlitePrivateHistoryRepository {
           .prepare(
             `SELECT
               p.product_variant_key,
+              p.provider_id,
               p.external_product_id,
               p.external_variant_id,
               p.product_name,
@@ -4024,7 +4133,9 @@ export class SqlitePrivateHistoryRepository {
           e.savings_cop,
           e.discount_percentage,
           e.confidence,
-          e.detected_at
+          e.detected_at,
+          e.provenance,
+          p.provider_id
         FROM opportunity_events e
         JOIN products p ON p.product_variant_key = e.product_variant_key
         JOIN stores s ON s.store_key = e.store_key
@@ -4050,6 +4161,8 @@ export class SqlitePrivateHistoryRepository {
       discount_percentage: number;
       confidence: ConfidenceLevel;
       detected_at: string;
+      provenance: string;
+      provider_id: string;
     }>;
 
     const activeOpportunities: DashboardOpportunityItem[] = oppRows.map((r) => ({
@@ -4072,6 +4185,8 @@ export class SqlitePrivateHistoryRepository {
       discountPercentage: r.discount_percentage,
       confidence: r.confidence,
       detectedAt: r.detected_at,
+      isSyntheticDemo:
+        r.provenance === "DEMO_FIXTURE" || r.provider_id === "fixture-colombia",
     }));
 
     return {
@@ -4092,6 +4207,7 @@ export class SqlitePrivateHistoryRepository {
         externalStoreId: productRow.external_store_id,
         firstSeenAt: productRow.first_seen_at,
         lastSeenAt: productRow.last_seen_at,
+        isSyntheticDemo: productRow.provider_id === "fixture-colombia",
       },
       statistics: {
         currentPriceCop,
@@ -4204,7 +4320,9 @@ export class SqlitePrivateHistoryRepository {
         e.savings_cop,
         e.discount_percentage,
         e.confidence,
-        e.detected_at
+        e.detected_at,
+        e.provenance,
+        p.provider_id
       FROM opportunity_events e
       JOIN products p ON p.product_variant_key = e.product_variant_key
       JOIN stores s ON s.store_key = e.store_key
@@ -4233,6 +4351,8 @@ export class SqlitePrivateHistoryRepository {
       discount_percentage: number;
       confidence: ConfidenceLevel;
       detected_at: string;
+      provenance: string;
+      provider_id: string;
     }>;
 
     const items: DashboardOpportunityItem[] = rows.map((r) => ({
@@ -4255,6 +4375,8 @@ export class SqlitePrivateHistoryRepository {
       discountPercentage: r.discount_percentage,
       confidence: r.confidence,
       detectedAt: r.detected_at,
+      isSyntheticDemo:
+        r.provenance === "DEMO_FIXTURE" || r.provider_id === "fixture-colombia",
     }));
 
     return {
@@ -4285,6 +4407,7 @@ export interface DashboardOpportunityItem {
   readonly discountPercentage: number;
   readonly confidence: ConfidenceLevel;
   readonly detectedAt: string;
+  readonly isSyntheticDemo?: boolean;
 }
 
 export interface ProductDetailObservationItem {
@@ -4365,6 +4488,7 @@ export interface CatalogProductSummaryItem {
     readonly discountPercentage: number;
     readonly confidence: string;
   };
+  readonly isSyntheticDemo?: boolean;
 }
 
 export interface PaginatedResult<T> {
@@ -4391,6 +4515,7 @@ export interface ProductDetailView {
     readonly externalStoreId: string;
     readonly firstSeenAt: string;
     readonly lastSeenAt: string;
+    readonly isSyntheticDemo?: boolean;
   };
   readonly statistics: {
     readonly currentPriceCop: CopAmount;

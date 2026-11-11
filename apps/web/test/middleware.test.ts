@@ -43,12 +43,16 @@ describe("Web Dashboard Middleware Security (Local & Cloud Trust Boundary)", () 
     expect(res.status).toBe(403);
   });
 
-  it("allows configured cloud domain via PRICERADAR_ALLOWED_HOSTS", () => {
+  it("allows configured cloud domain via PRICERADAR_ALLOWED_HOSTS when authenticated", () => {
     process.env.PRICERADAR_ALLOWED_HOSTS = "priceradar.up.railway.app,*.railway.app";
+    process.env.PRICERADAR_WEB_PASSWORD = "test-cloud-pass";
+
+    const authHeader = `Basic ${btoa("admin:test-cloud-pass")}`;
 
     const req = new NextRequest("https://priceradar.up.railway.app/products", {
       headers: {
         host: "priceradar.up.railway.app",
+        authorization: authHeader,
       },
     });
     const res = middleware(req);
@@ -57,6 +61,7 @@ describe("Web Dashboard Middleware Security (Local & Cloud Trust Boundary)", () 
     const subReq = new NextRequest("https://my-feature-pr.railway.app/coverage", {
       headers: {
         host: "my-feature-pr.railway.app",
+        authorization: authHeader,
       },
     });
     const subRes = middleware(subReq);
@@ -121,6 +126,75 @@ describe("Web Dashboard Middleware Security (Local & Cloud Trust Boundary)", () 
     });
     const res = middleware(req);
     expect(res.status).toBe(403);
+  });
+
+  it("fails closed on remote/cloud requests when PRICERADAR_WEB_PASSWORD is missing", () => {
+    delete process.env.PRICERADAR_WEB_PASSWORD;
+    process.env.PRICERADAR_ALLOWED_HOSTS = "priceradar.up.railway.app";
+
+    const req = new NextRequest("https://priceradar.up.railway.app/products", {
+      headers: {
+        host: "priceradar.up.railway.app",
+      },
+    });
+    const res = middleware(req);
+    // Must FAIL CLOSED (401), never allow unauthenticated remote access
+    expect(res.status).toBe(401);
+  });
+
+  it("fails closed on remote/cloud requests when PRICERADAR_WEB_PASSWORD is empty or whitespace", () => {
+    process.env.PRICERADAR_WEB_PASSWORD = "   ";
+    process.env.PRICERADAR_ALLOWED_HOSTS = "priceradar.up.railway.app";
+
+    const req = new NextRequest("https://priceradar.up.railway.app/coverage", {
+      headers: {
+        host: "priceradar.up.railway.app",
+      },
+    });
+    const res = middleware(req);
+    expect(res.status).toBe(401);
+  });
+
+  it("requires authentication on loopback if PRICERADAR_WEB_PASSWORD is set", () => {
+    process.env.PRICERADAR_WEB_PASSWORD = "loopback-guard";
+
+    // 1. Missing credentials on loopback -> 401
+    const unauthReq = new NextRequest("http://127.0.0.1:4178/", {
+      headers: {
+        host: "127.0.0.1:4178",
+      },
+    });
+    expect(middleware(unauthReq).status).toBe(401);
+
+    // 2. Valid credentials on loopback -> 200
+    const authReq = new NextRequest("http://127.0.0.1:4178/", {
+      headers: {
+        host: "127.0.0.1:4178",
+        authorization: `Basic ${btoa("owner:loopback-guard")}`,
+      },
+    });
+    expect(middleware(authReq).status).toBe(200);
+  });
+
+  it("rejects hostile Host headers attempting substring or suffix spoofing", () => {
+    process.env.PRICERADAR_ALLOWED_HOSTS = "priceradar.up.railway.app,*.railway.app";
+
+    const hostileHosts = [
+      "priceradar.up.railway.app.evil.com",
+      "attacker-railway.app",
+      "notrailway.app",
+      "evil.com",
+      "127.0.0.1.attacker.com",
+      "localhost.evil.com:4178",
+    ];
+
+    for (const hostileHost of hostileHosts) {
+      const req = new NextRequest(`https://${hostileHost}/products`, {
+        headers: { host: hostileHost },
+      });
+      const res = middleware(req);
+      expect(res.status).toBe(403);
+    }
   });
 
   it("allows same-origin or none Sec-Fetch-Site", () => {

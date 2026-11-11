@@ -18,7 +18,9 @@ import type {
 
 export interface CloudSchedulerStatusInfo {
   readonly isRunning: boolean;
+  readonly isScanning?: boolean;
   readonly totalScansExecuted: number;
+  readonly lastHeartbeatAt?: string;
   readonly lastScanStartedAt?: string;
   readonly lastScanCompletedAt?: string;
   readonly lastScanStatus?: string;
@@ -26,6 +28,7 @@ export interface CloudSchedulerStatusInfo {
   readonly intervalMinutes: number;
   readonly activeProvider: string;
   readonly lastErrorSummary?: string;
+  readonly isStale?: boolean;
 }
 
 let cachedRepo: SqlitePrivateHistoryRepository | null = null;
@@ -134,16 +137,84 @@ export function fetchRecentScanRuns(limit = 20): {
   return { runs: repo.listRecentScanRuns(limit), dbExists: true };
 }
 
-export function fetchSchedulerStatus(): CloudSchedulerStatusInfo | null {
+/**
+ * Retrieves the current scheduler status (`F7-05`).
+ * Validates timestamped heartbeat against freshness threshold (default 90s).
+ * Recovers or augments status from durable SQLite scan_runs table when file is missing or corrupted.
+ */
+export function fetchSchedulerStatus(
+  freshnessThresholdMs = 90_000,
+): CloudSchedulerStatusInfo | null {
   const dbPath = path.resolve(getDatabasePath());
   const statusFile = path.join(path.dirname(dbPath), "scheduler-status.json");
+  let status: CloudSchedulerStatusInfo | null = null;
+
   if (fs.existsSync(statusFile)) {
     try {
       const content = fs.readFileSync(statusFile, "utf-8");
-      return JSON.parse(content) as CloudSchedulerStatusInfo;
+      status = JSON.parse(content) as CloudSchedulerStatusInfo;
     } catch {
-      return null;
+      status = null;
     }
   }
-  return null;
+
+  // F7-05: Heartbeat freshness verification
+  if (status) {
+    if (status.isRunning && status.lastHeartbeatAt) {
+      const heartbeatAgeMs = Date.now() - Date.parse(status.lastHeartbeatAt);
+      if (heartbeatAgeMs > freshnessThresholdMs) {
+        status = {
+          ...status,
+          isRunning: false,
+          isScanning: false,
+          isStale: true,
+        };
+      }
+    }
+  }
+
+  // F7-05: Fallback / augment with durable SQLite scan runs
+  const { repo, dbExists } = getReadOnlyDatabase();
+  if (repo && dbExists) {
+    try {
+      const recentRuns = repo.listRecentScanRuns(1);
+      const latestRun = recentRuns[0];
+      if (latestRun) {
+        if (!status) {
+          status = {
+            isRunning: false,
+            isScanning: false,
+            isStale: true,
+            totalScansExecuted: 1,
+            lastScanStartedAt: latestRun.startedAt,
+            ...(latestRun.completedAt
+              ? { lastScanCompletedAt: latestRun.completedAt }
+              : {}),
+            lastScanStatus:
+              latestRun.status === "SUCCEEDED" ? "SUCCEEDED" : latestRun.status,
+            intervalMinutes: 60,
+            activeProvider: latestRun.providerId ?? "fixture-colombia",
+            ...(latestRun.errorSummary
+              ? { lastErrorSummary: latestRun.errorSummary }
+              : {}),
+          };
+        } else if (!status.lastScanStartedAt) {
+          status = {
+            ...status,
+            lastScanStartedAt: latestRun.startedAt,
+            ...(latestRun.completedAt
+              ? { lastScanCompletedAt: latestRun.completedAt }
+              : {}),
+            lastScanStatus:
+              status.lastScanStatus ??
+              (latestRun.status === "SUCCEEDED" ? "SUCCEEDED" : latestRun.status),
+          };
+        }
+      }
+    } catch {
+      // Best-effort database fallback
+    }
+  }
+
+  return status;
 }

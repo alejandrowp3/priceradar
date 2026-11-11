@@ -63,11 +63,25 @@ export default function SystemStatusPage() {
         />
         <StatCard
           title="Programador Cloud"
-          value={schedulerStatus?.isRunning ? "Activo" : "En Espera"}
+          value={
+            schedulerStatus?.isStale
+              ? "Sin Latido (Stale)"
+              : schedulerStatus?.isRunning
+                ? "Activo"
+                : "En Espera"
+          }
           subtitle={`Intervalo: cada ${String(schedulerStatus?.intervalMinutes ?? 60)} min`}
           badge={{
-            label: schedulerStatus?.isRunning ? "En ejecución" : "Standby",
-            variant: schedulerStatus?.isRunning ? "signal" : "neutral",
+            label: schedulerStatus?.isStale
+              ? "Desconectado"
+              : schedulerStatus?.isRunning
+                ? "En ejecución"
+                : "Standby",
+            variant: schedulerStatus?.isStale
+              ? "amber"
+              : schedulerStatus?.isRunning
+                ? "signal"
+                : "neutral",
           }}
         />
         <StatCard

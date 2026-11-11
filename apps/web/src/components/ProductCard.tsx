@@ -50,16 +50,40 @@ export function ProductCard({ product }: ProductCardProps) {
             flexWrap: "wrap",
           }}
         >
-          {product.activeOpportunity ? (
-            <PriceBadge opportunityType={product.activeOpportunity.type} size="sm" />
-          ) : (
-            <PriceBadge
-              changeType={priceChange}
-              diffCop={product.priceDifferenceCop}
-              diffPercentage={product.priceDifferencePercentage}
-              size="sm"
-            />
-          )}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.375rem",
+              flexWrap: "wrap",
+            }}
+          >
+            {product.activeOpportunity ? (
+              <PriceBadge opportunityType={product.activeOpportunity.type} size="sm" />
+            ) : (
+              <PriceBadge
+                changeType={priceChange}
+                diffCop={product.priceDifferenceCop}
+                diffPercentage={product.priceDifferencePercentage}
+                size="sm"
+              />
+            )}
+            {product.isSyntheticDemo && (
+              <span
+                style={{
+                  fontSize: "0.6875rem",
+                  fontWeight: 600,
+                  padding: "0.125rem 0.375rem",
+                  borderRadius: "var(--radius-sm)",
+                  backgroundColor: "rgba(148, 163, 184, 0.15)",
+                  color: "var(--text-muted)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                [DEMO SINTÉTICO]
+              </span>
+            )}
+          </div>
 
           <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
             {product.observationCount} {product.observationCount === 1 ? "obs" : "obs"}

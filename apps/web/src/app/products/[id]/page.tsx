@@ -108,6 +108,21 @@ export default async function ProductDetailPage({ params }: ProductDetailPagePro
                 diffCop={statistics.priceDifferenceCop}
                 diffPercentage={statistics.priceDifferencePercentage}
               />
+              {product.isSyntheticDemo && (
+                <span
+                  style={{
+                    fontSize: "0.75rem",
+                    fontWeight: 600,
+                    padding: "0.2rem 0.5rem",
+                    borderRadius: "var(--radius-sm)",
+                    backgroundColor: "rgba(148, 163, 184, 0.15)",
+                    color: "var(--text-muted)",
+                    border: "1px solid var(--border)",
+                  }}
+                >
+                  [DEMO SINTÉTICO]
+                </span>
+              )}
             </div>
 
             <h1

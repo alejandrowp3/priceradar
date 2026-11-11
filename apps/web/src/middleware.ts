@@ -9,17 +9,26 @@ const ALLOWED_LOOPBACK_HOSTS = new Set([
 ]);
 
 /**
+ * Checks whether a host string represents a verified local loopback interface.
+ */
+export function isLoopbackHost(host: string): boolean {
+  if (!host) return false;
+  const hostname = host.split(":")[0]?.trim().toLowerCase() ?? "";
+  return (
+    ALLOWED_LOOPBACK_HOSTS.has(host) ||
+    hostname === "127.0.0.1" ||
+    hostname === "localhost"
+  );
+}
+
+/**
  * Validates Host header against local loopback bindings and configured cloud hostnames
  * to neutralize DNS rebinding attacks while supporting secure cloud deployments.
  */
 export function isHostAllowed(host: string, customAllowedHosts?: string): boolean {
   if (!host) return false;
-  const hostname = host.split(":")[0] ?? "";
-  if (
-    ALLOWED_LOOPBACK_HOSTS.has(host) ||
-    hostname === "127.0.0.1" ||
-    hostname === "localhost"
-  ) {
+  const hostname = host.split(":")[0]?.trim().toLowerCase() ?? "";
+  if (isLoopbackHost(host)) {
     return true;
   }
 
@@ -56,13 +65,23 @@ export function isHostAllowed(host: string, customAllowedHosts?: string): boolea
 }
 
 /**
- * Checks HTTP Basic Authentication when PRICERADAR_WEB_PASSWORD is configured.
+ * Checks HTTP Basic Authentication with fail-closed semantics (`F7-01`):
+ * - Remote (non-loopback) access with missing or empty password MUST fail closed.
+ * - Passwordless access is strictly forbidden outside verified loopback binding.
  */
 export function isAuthorized(request: NextRequest, expectedPassword?: string): boolean {
-  const secret = expectedPassword ?? process.env.PRICERADAR_WEB_PASSWORD;
-  if (!secret) {
-    // If no password is configured, access is unauthenticated (e.g. local loopback development)
+  const host = request.headers.get("host") ?? "";
+  const isLoopback = isLoopbackHost(host);
+  const secret = (expectedPassword ?? process.env.PRICERADAR_WEB_PASSWORD)?.trim();
+
+  // Local loopback binding without password configured is permitted for local development only
+  if (isLoopback && (!secret || secret === "")) {
     return true;
+  }
+
+  // Fail-closed: non-loopback (remote/cloud) access with missing or empty password is NEVER authorized
+  if (!secret || secret === "") {
+    return false;
   }
 
   const authHeader = request.headers.get("authorization");

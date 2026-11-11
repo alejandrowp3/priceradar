@@ -67,8 +67,9 @@ As clarified by the repository owner, **PriceRadar must be hosted in the cloud f
    - Configured via `PRICERADAR_WEB_PASSWORD`.
    - When set, requests must supply valid HTTP Basic Auth credentials (`Authorization: Basic <base64>`).
    - Unauthenticated requests receive HTTP 401 with `WWW-Authenticate: Basic realm="PriceRadar Private Dashboard"`, prompting the browser's native login modal.
-3. **Platform Health Check Exemption**:
-   - `/api/health` is exempt from Basic Auth to allow Railway/Render platform orchestrators to monitor container health and restart failing instances automatically.
+3. **Platform Health Check & Telemetry Separation**:
+   - `/api/health` is exempt from Basic Auth and provides a minimal public readiness probe (`{"status":"healthy","ready":true}`). It exposes zero filesystem paths, database names, fulfillment hashes, or scheduler timestamps.
+   - `/api/telemetry` provides detailed operational KPIs and requires full authentication.
 
 ---
 
@@ -116,7 +117,7 @@ The initial deployment increment achieves:
 4. **Deterministic Test Collector**: `FixtureCatalogProvider` executes scheduled scans, discovering items, calculating price drops, and persisting observations without third-party network flakiness.
 5. **Telemetry & Execution History**:
    - `/system` page displaying real-time infrastructure KPIs, scheduler state, and scan run history table.
-   - `/api/health` route returning structured JSON health metrics.
+   - Minimal unauthenticated `/api/health` probe and authenticated `/api/telemetry` operational endpoint.
 
 ---
 

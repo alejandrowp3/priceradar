@@ -21,7 +21,9 @@ export interface CloudSchedulerOptions {
 
 export interface CloudSchedulerStatus {
   readonly isRunning: boolean;
+  readonly isScanning: boolean;
   readonly totalScansExecuted: number;
+  readonly lastHeartbeatAt: string;
   readonly lastScanStartedAt?: string;
   readonly lastScanCompletedAt?: string;
   readonly lastScanStatus?: string;
@@ -29,6 +31,7 @@ export interface CloudSchedulerStatus {
   readonly intervalMinutes: number;
   readonly activeProvider: string;
   readonly lastErrorSummary?: string;
+  readonly isStale?: boolean;
 }
 
 const VALID_TEST_CTX_HASH = "ctx-88be5762563932c5";
@@ -40,6 +43,7 @@ export class CloudScheduler {
   private readonly statusFilePath: string;
   private readonly logger: (message: string) => void;
   private timer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
   private isScanning = false;
   private isRunning = false;
   private totalScansExecuted = 0;
@@ -76,7 +80,9 @@ export class CloudScheduler {
   public getStatus(): CloudSchedulerStatus {
     return {
       isRunning: this.isRunning,
+      isScanning: this.isScanning,
       totalScansExecuted: this.totalScansExecuted,
+      lastHeartbeatAt: new Date().toISOString(),
       ...(this.lastScanStartedAt ? { lastScanStartedAt: this.lastScanStartedAt } : {}),
       ...(this.lastScanCompletedAt
         ? { lastScanCompletedAt: this.lastScanCompletedAt }
@@ -91,17 +97,18 @@ export class CloudScheduler {
     };
   }
 
-  private writeStatusFile(): void {
+  /**
+   * Writes the scheduler status atomically using temporary file + rename (`F7-05`).
+   */
+  public writeStatusFile(): void {
     try {
       const dir = path.dirname(this.statusFilePath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(
-        this.statusFilePath,
-        JSON.stringify(this.getStatus(), null, 2),
-        "utf-8",
-      );
+      const tmpPath = `${this.statusFilePath}.tmp.${String(process.pid)}.${String(Date.now())}`;
+      fs.writeFileSync(tmpPath, JSON.stringify(this.getStatus(), null, 2), "utf-8");
+      fs.renameSync(tmpPath, this.statusFilePath);
     } catch (err: unknown) {
       // Non-fatal logging for status file write
       this.logger(`Warning: failed to write scheduler status file: ${String(err)}`);
@@ -115,6 +122,15 @@ export class CloudScheduler {
 
     this.isRunning = true;
     this.scheduleNext();
+
+    // Start periodic heartbeat timer (15s interval) (F7-05)
+    this.heartbeatTimer = setInterval(() => {
+      if (this.isRunning) {
+        this.writeStatusFile();
+      }
+    }, 15_000);
+    this.heartbeatTimer.unref();
+
     this.writeStatusFile();
 
     this.logger(
@@ -133,6 +149,10 @@ export class CloudScheduler {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
     this.isRunning = false;
     this.nextScheduledScanAt = undefined;
@@ -160,6 +180,8 @@ export class CloudScheduler {
   /**
    * Executes one deterministic collection scan cycle.
    * Milestone 1 collects deterministic data from FixtureCatalogProvider and persists it.
+   * F7-03: Fictional observations are explicitly labeled as DEMO_FIXTURE and UNVERIFIED_DEMO_FIXTURE.
+   * F7-06: Distributed worker lock prevents duplicate replicas from executing concurrently.
    */
   public async executeScheduledScan(): Promise<PersistApprovedBatchResult | null> {
     if (this.isScanning) {
@@ -171,6 +193,9 @@ export class CloudScheduler {
     const nowIso = new Date().toISOString();
     this.lastScanStartedAt = nowIso;
     const scanRunId = `cloud-sched-${String(Date.now())}`;
+    const lockKey = "cloud-scheduler:leader-scan-lock";
+    let repo: SqlitePrivateHistoryRepository | null = null;
+    let lockAcquired = false;
 
     try {
       this.logger(`Starting scheduled collection run '${scanRunId}'...`);
@@ -181,7 +206,20 @@ export class CloudScheduler {
         fs.mkdirSync(dbDir, { recursive: true });
       }
 
-      const repo = new SqlitePrivateHistoryRepository(this.dbPath);
+      repo = new SqlitePrivateHistoryRepository(this.dbPath);
+
+      // F7-06: Acquire multi-replica worker lock (10 minutes lease TTL)
+      lockAcquired = repo.acquireWorkerLock(lockKey, scanRunId, 10 * 60 * 1000, nowIso);
+      if (!lockAcquired) {
+        this.logger(
+          `Another worker holds scheduler lock '${lockKey}'. Skipping this scan cycle (SKIPPED_LOCKED).`,
+        );
+        this.lastScanStatus = "SKIPPED_LOCKED";
+        this.lastScanCompletedAt = new Date().toISOString();
+        this.writeStatusFile();
+        return null;
+      }
+
       const provider = new FixtureCatalogProvider();
 
       // Collect from fixture targets deterministically
@@ -199,44 +237,44 @@ export class CloudScheduler {
 
       this.simulationStep = (this.simulationStep + 1) % 3;
 
+      // F7-03: Explicitly synthetic demo context and unverified demo verdict
       const context: SupervisedPersistenceContextInput = {
         scanRunId,
         observedAtIso: nowIso,
         gateStatus: "VERIFIED_ACTIVE_SELECTION",
         hasSecurityChallenge: false,
         isLoginRequired: false,
-        isDeliveryContextVerified: true,
+        isDeliveryContextVerified: false,
         citySlug: "bogota",
-        cityName: "Bogotá D.C.",
+        cityName: "Bogotá D.C. (Demo)",
         fulfillmentContextHash: VALID_TEST_CTX_HASH,
-        activeAddressSelection: "VERIFIED_ACTIVE_SELECTION",
-        cityAndNeighborhoodMetadata: "VERIFIED_FROM_ACTIVE_CONTEXT",
-        servingStoreBranch: "VERIFIED_ACTIVE_BRANCH_FROM_PAGE",
-        productCatalogContext: "VERIFIED_ACTIVE_CATALOG",
-        pricingVerificationVerdict: "VERIFIED_ADDRESS_SPECIFIC_PRICING",
+        activeAddressSelection: "UNVERIFIED_SESSION_DEFAULT",
+        cityAndNeighborhoodMetadata: "SYNTHETIC_DEMO_CONTEXT",
+        servingStoreBranch: "DEMO_FIXTURE_STORE",
+        productCatalogContext: "SYNTHETIC_DEMO_CATALOG",
+        pricingVerificationVerdict: "UNVERIFIED_DEMO_FIXTURE",
         navigationStates: {
-          ADDRESS_SELECTED: true,
-          STORE_OPENED_FROM_ADDRESS_CONTEXT: true,
+          ADDRESS_SELECTED: false,
+          STORE_OPENED_FROM_ADDRESS_CONTEXT: false,
           CATALOG_VISIBLE_IN_SESSION: true,
-          ADDRESS_SPECIFIC_PRICING_VERIFIED: true,
+          ADDRESS_SPECIFIC_PRICING_VERIFIED: false,
         },
         candidatesDiscoveredCount: allListings.length,
         skippedMalformedCount: 0,
         duplicateSuppressedCount: 0,
         listings: allListings,
+        isDemoFixture: true,
         sourceView: {
           viewKey: "/cloud-scheduled/fixture-colombia",
           pageKind: "STORE_SUBPATH",
           labelSource: "OWNER_PROVIDED",
-          ownerLabel: "Colección Programada en Nube (Milestone 1)",
+          ownerLabel: "Colección Programada en Nube (Demo Sintético)",
         },
       };
 
       const persistResult = repo.persistApprovedInspectionBatch(context, {
         ownerConfirmed: true,
       });
-
-      repo.close();
 
       this.totalScansExecuted += 1;
       this.lastScanCompletedAt = new Date().toISOString();
@@ -258,6 +296,16 @@ export class CloudScheduler {
       this.writeStatusFile();
       return null;
     } finally {
+      if (repo) {
+        if (lockAcquired) {
+          try {
+            repo.releaseWorkerLock(lockKey, scanRunId);
+          } catch {
+            // best-effort lock release
+          }
+        }
+        repo.close();
+      }
       this.isScanning = false;
     }
   }
