@@ -94,6 +94,7 @@ jobs:
             -p 4178:4178 \
             -v /tmp/priceradar-ci-data:/data \
             -e PRICERADAR_ENV=cloud \
+            -e PRICERADAR_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
             -e PRICERADAR_SQLITE_PATH=/data/private-history.sqlite \
             -e PRICERADAR_SCAN_ON_STARTUP=true \
@@ -117,6 +118,14 @@ jobs:
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4178/)
           if [ "$HTTP_CODE" != "401" ]; then
             echo "ERROR: Expected HTTP 401 on unauthenticated root request, received $HTTP_CODE"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying unauthorized Host header is rejected with 403..."
+          FORGED_HOST_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: attacker.com" http://127.0.0.1:4178/)
+          if [ "$FORGED_HOST_CODE" != "403" ]; then
+            echo "ERROR: Expected HTTP 403 on forged Host header, received $FORGED_HOST_CODE"
             docker logs priceradar-ci
             exit 1
           fi
