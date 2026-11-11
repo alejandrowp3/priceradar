@@ -50,11 +50,16 @@ As clarified by the repository owner, **PriceRadar must be hosted in the cloud f
 - **Engine**: SQLite 3 with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`).
 - **Location**: `/data/private-history.sqlite` on a dedicated 5 GB persistent SSD volume mounted at `/data`.
 - **Repository Isolation**: `/data` is outside `/app` (the Git repository root), satisfying `assertDatabasePathOutsideRepository()`.
-- **Storage Readiness & Persistent Contract (`F7-08`, `F7-11`)**:
+- **Storage Readiness & Persistent Contract (`F7-08`, `F7-11`, `F7-11A`, `F7-11B`)**:
   - The system explicitly distinguishes a writable filesystem from a verified persistent volume (`F7-11`). Dockerfile `VOLUME ["/data"]` alone is not proof of durable cloud storage.
-  - In cloud mode (`PRICERADAR_ENV=cloud` or platform indicators), verified persistent volumes are recognized via `RAILWAY_VOLUME_NAME`, `RAILWAY_VOLUME_MOUNT_PATH`, or `PRICERADAR_VOLUME_NAME`. Unverified ephemeral container filesystems fail closed with HTTP 503 to prevent data loss.
-  - In CI, simulated persistent volumes are explicitly tagged with `PRICERADAR_PERSISTENCE_TIER="SIMULATED_CI_VOLUME"`.
-  - Atomic volume markers (`.priceradar-volume-marker.json`) are written upon volume mount to establish stable volume identity across container restarts and replacements.
+  - **Mount Path Validation (`F7-11A`)**: In Railway mode, `RAILWAY_VOLUME_MOUNT_PATH` (e.g. `/data`) is validated against the configured SQLite storage directory. The storage path must match or be contained within the platform-injected mount path. Arbitrary volume-name environment declarations without verified mount paths are rejected.
+  - **CI Confinement (`F7-11A`)**: `PRICERADAR_PERSISTENCE_TIER="SIMULATED_CI_VOLUME"` is strictly restricted to automated CI and test environments (`CI=true` / `NODE_ENV=test`); setting this tier in cloud production fails closed.
+  - **Platform Evidence vs. Restart Proof (`F7-11A`)**: The system distinguishes platform configuration evidence (`evidenceType: "RAILWAY_PLATFORM_MOUNT"`) from persistence verified by restart testing (`restartProofVerified: true`).
+  - **Fail-Closed Volume Marker Protocol (`F7-11B`)**:
+    - Atomic volume markers (`.priceradar-volume-marker.json`) are written upon volume mount to establish stable volume identity across container restarts and replacements.
+    - If marker creation or write fails, the system fails closed with HTTP 503 instead of reporting success.
+    - Existing markers are validated before trust (checking `volumeId`, `createdAt`, `storagePath`, and `persistenceTier`). Corrupted or incomplete markers fail closed and are never silently overwritten.
+    - **Marker Recovery Procedure**: If a marker becomes corrupted due to hardware anomalies, an authorized operator can safely remove or regenerate the `.priceradar-volume-marker.json` file on the persistent volume after confirming SQLite file integrity.
   - The readiness probe distinguishes first-time initialization (mounted and writable volume before the initial scan has executed) from an unmounted or inaccessible volume.
   - When the database file exists, read integrity and schema readiness are verified before reporting healthy.
 - **Concurrency Model & Distributed Lease Locks (`F7-06`, `F7-09`)**:
@@ -141,3 +146,11 @@ The initial deployment increment achieves:
 1. **Remote Session State Sync**: Completing Workflow A (`pnpm cloud:session-sync`) so the cloud worker has the owner's authorized delivery address and session cookies without manual intervention in the container.
 2. **Datacenter Geo-IP Routing Verification**: Cloud servers in US-East or generic cloud regions must be tested to confirm whether Rappi Turbo API routes catalog availability based on the address context or if cloud IPs trigger Cloudflare/WAF challenges. If WAF blocks datacenter IPs, an egress proxy (e.g., Colombian proxy or residential tunnel) will be configured.
 3. **Explicit Owner Approval for Live Data**: Live credentials and personal addresses will only be synchronized after the owner verifies the cloud dashboard on Milestone 1.
+
+---
+
+## 8. Remaining Limitations Specific to Railway Deployment
+
+1. **Single-Service Volume Attachment**: Railway persistent volumes attach exclusively to a single service instance (`numReplicas: 1`). They cannot be mounted simultaneously across multiple independent Railway services, which matches PriceRadar's unified container architecture where Next.js server components and the background scheduler run co-located, sharing `/data/private-history.sqlite`.
+2. **Single-Region Bound**: Railway volumes are provisioned within a specific Railway datacenter region. Relocating a deployment to a different region requires creating a new volume and transferring the SQLite database snapshot.
+3. **Rolling Deployment Handover**: During deployment updates, Railway gracefully stops the previous container and boots the new replacement container mounting the exact same persistent disk. PriceRadar's atomic worker lease lock, pre-commit lock validation, and volume marker verification ensure seamless, corruption-free handovers across replacements.

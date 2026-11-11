@@ -160,8 +160,24 @@ if (fs.existsSync(storagePersistencePath)) {
       content.includes("RAILWAY_PERSISTENT_VOLUME"),
   );
   assertCondition(
-    "Storage persistence writes atomic volume marker for restart durability",
+    "Storage persistence validates volume mount paths against storage directory (F7-11A)",
+    content.includes("RAILWAY_VOLUME_MOUNT_PATH") &&
+      content.includes("isStorageContainedInMount"),
+  );
+  assertCondition(
+    "Storage persistence restricts SIMULATED_CI_VOLUME strictly to CI/test (F7-11A)",
+    content.includes('env.CI === "true"') &&
+      content.includes("SIMULATED_CI_VOLUME persistence tier is strictly restricted"),
+  );
+  assertCondition(
+    "Storage persistence writes atomic volume marker for restart durability (F7-11B)",
     content.includes("VOLUME_MARKER_FILENAME") && content.includes(".tmp"),
+  );
+  assertCondition(
+    "Storage persistence fails closed on marker write failure and validates existing markers (F7-11B)",
+    content.includes("Failed to write persistent volume marker") &&
+      content.includes("Corrupted volume marker detected") &&
+      content.includes("Incomplete or malformed volume marker"),
   );
 }
 

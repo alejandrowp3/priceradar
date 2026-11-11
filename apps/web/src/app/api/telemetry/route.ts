@@ -15,11 +15,12 @@ export const dynamic = "force-dynamic";
  * - Exposes detailed operational and scheduler metrics for authorized administrators.
  */
 export async function GET(): Promise<NextResponse> {
-  const { dbExists } = getReadOnlyDatabase();
+  const { dbExists, repo } = getReadOnlyDatabase();
   const schedulerStatus = fetchSchedulerStatus();
   const storageReadiness = checkStorageReadiness();
   const systemReadiness = checkSystemReadiness();
   const { runs } = fetchRecentScanRuns(5);
+  const summary = repo && dbExists ? repo.getDashboardSummary() : null;
 
   const payload = {
     service: "priceradar-cloud",
@@ -28,10 +29,12 @@ export async function GET(): Promise<NextResponse> {
     database: {
       connected: dbExists,
       storageReadiness,
+      counts: summary?.counts ?? null,
     },
     storageReadiness,
     systemReadiness,
     scheduler: schedulerStatus,
+    summary,
     recentExecutionsCount: runs.length,
     latestExecution: runs[0] ?? null,
   };

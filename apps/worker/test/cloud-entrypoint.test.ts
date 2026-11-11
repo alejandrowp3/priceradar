@@ -86,6 +86,7 @@ describe("Cloud Entrypoint Configuration Validation (F7-01 & F7-06)", () => {
         PRICERADAR_ENV: "cloud",
         RAILWAY_ENVIRONMENT: "production",
         RAILWAY_VOLUME_NAME: "priceradar-data",
+        RAILWAY_VOLUME_MOUNT_PATH: "/tmp",
         PRICERADAR_SQLITE_PATH: "/tmp/private-history.sqlite",
       });
 
@@ -98,6 +99,7 @@ describe("Cloud Entrypoint Configuration Validation (F7-01 & F7-06)", () => {
         HOST: "0.0.0.0",
         PRICERADAR_WEB_PASSWORD: "secure-password-123",
         PRICERADAR_ENV: "cloud",
+        CI: "true",
         PRICERADAR_PERSISTENCE_TIER: "SIMULATED_CI_VOLUME",
         PRICERADAR_SQLITE_PATH: "/tmp/private-history.sqlite",
       });

@@ -94,6 +94,7 @@ jobs:
             -p 4178:4178 \
             -v /tmp/priceradar-ci-data:/data \
             -e PRICERADAR_ENV=cloud \
+            -e CI=true \
             -e PRICERADAR_PERSISTENCE_TIER=SIMULATED_CI_VOLUME \
             -e PRICERADAR_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
@@ -146,23 +147,40 @@ jobs:
           echo "$TELEMETRY_JSON" | grep -q '"persistenceTier":"SIMULATED_CI_VOLUME"'
           echo "$TELEMETRY_JSON" | grep -q '"persistenceVerified":true'
 
-          echo "Extracting volume marker ID from Container 1..."
+          echo "Recording deterministic identities, observation counts, and COP prices in Container 1 (F7-11C)..."
           CONTAINER_1_VOL_ID=$(echo "$TELEMETRY_JSON" | grep -o '"volumeId":"[^"]*"' | head -1 | cut -d'"' -f4)
+          OBS_COUNT_1=$(echo "$TELEMETRY_JSON" | grep -o '"totalActiveObservations":[0-9]*' | head -1 | cut -d':' -f2)
+          PROD_COUNT_1=$(echo "$TELEMETRY_JSON" | grep -o '"totalDistinctProducts":[0-9]*' | head -1 | cut -d':' -f2)
           echo "Container 1 Volume ID: $CONTAINER_1_VOL_ID"
+          echo "Container 1 Observations: $OBS_COUNT_1"
+          echo "Container 1 Products: $PROD_COUNT_1"
+
+          if [ -z "$OBS_COUNT_1" ] || [ "$OBS_COUNT_1" -le 0 ]; then
+            echo "ERROR: Container 1 did not persist observations (count: $OBS_COUNT_1)"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying specific synthetic product identities and COP prices in Container 1..."
+          echo "$TELEMETRY_JSON" | grep -q 'prod-cafe-huila'
+          echo "$TELEMETRY_JSON" | grep -q '31500'
+          echo "$TELEMETRY_JSON" | grep -q 'prod-aceite-oliva-med'
+          echo "$TELEMETRY_JSON" | grep -q '48000'
 
           echo "Verifying persistent storage files created in mounted volume..."
           ls -la /tmp/priceradar-ci-data/
 
-          echo "Stopping Container 1 to test restart & replacement survivability (F7-11)..."
+          echo "Stopping Container 1 to test container replacement and database continuity (F7-11C)..."
           docker stop priceradar-ci
           docker rm priceradar-ci
 
-          echo "Starting Container 2 (replacement container mounting same volume)..."
+          echo "Starting Container 2 (replacement container mounting same volume, scan disabled to verify pure persistence)..."
           docker run -d \
             --name priceradar-ci-restarted \
             -p 4178:4178 \
             -v /tmp/priceradar-ci-data:/data \
             -e PRICERADAR_ENV=cloud \
+            -e CI=true \
             -e PRICERADAR_PERSISTENCE_TIER=SIMULATED_CI_VOLUME \
             -e PRICERADAR_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
@@ -179,10 +197,15 @@ jobs:
             sleep 1
           done
 
-          echo "Verifying Container 2 reconnected to existing volume with stable identity..."
+          echo "Verifying Container 2 reconnected to existing volume with stable identity (F7-11C)..."
           TELEMETRY_2_JSON=$(curl -s -H "$AUTH_HEADER" http://127.0.0.1:4178/api/telemetry)
           CONTAINER_2_VOL_ID=$(echo "$TELEMETRY_2_JSON" | grep -o '"volumeId":"[^"]*"' | head -1 | cut -d'"' -f4)
+          OBS_COUNT_2=$(echo "$TELEMETRY_2_JSON" | grep -o '"totalActiveObservations":[0-9]*' | head -1 | cut -d':' -f2)
+          PROD_COUNT_2=$(echo "$TELEMETRY_2_JSON" | grep -o '"totalDistinctProducts":[0-9]*' | head -1 | cut -d':' -f2)
+
           echo "Container 2 Volume ID: $CONTAINER_2_VOL_ID"
+          echo "Container 2 Observations: $OBS_COUNT_2"
+          echo "Container 2 Products: $PROD_COUNT_2"
 
           if [ "$CONTAINER_1_VOL_ID" != "$CONTAINER_2_VOL_ID" ]; then
             echo "ERROR: Volume ID changed across container replacement: '$CONTAINER_1_VOL_ID' vs '$CONTAINER_2_VOL_ID'"
@@ -190,9 +213,36 @@ jobs:
             exit 1
           fi
 
-          echo "Verifying data survived container replacement..."
-          echo "$TELEMETRY_2_JSON" | grep -q '"connected":true'
+          if [ "$OBS_COUNT_1" != "$OBS_COUNT_2" ]; then
+            echo "ERROR: Observation counts do not match across replacement: '$OBS_COUNT_1' vs '$OBS_COUNT_2'"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
 
-          echo "Container replacement and persistent storage verification PASSED!"
+          if [ "$PROD_COUNT_1" != "$PROD_COUNT_2" ]; then
+            echo "ERROR: Product counts do not match across replacement: '$PROD_COUNT_1' vs '$PROD_COUNT_2'"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
+
+          echo "Verifying exact persisted identities and COP prices survived in Container 2..."
+          echo "$TELEMETRY_2_JSON" | grep -q 'prod-cafe-huila'
+          echo "$TELEMETRY_2_JSON" | grep -q '31500'
+          echo "$TELEMETRY_2_JSON" | grep -q 'prod-aceite-oliva-med'
+          echo "$TELEMETRY_2_JSON" | grep -q '48000'
+
+          echo "Confirming replacement did NOT silently recreate an empty database..."
+          if [ "$OBS_COUNT_2" -le 0 ]; then
+            echo "ERROR: Database in Container 2 is empty after replacement!"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
+
+          echo "Confirming Container 2 readiness remains healthy..."
+          C2_HEALTH=$(curl -s http://127.0.0.1:4178/api/health)
+          echo "$C2_HEALTH" | grep -q '"status":"healthy"'
+          echo "$C2_HEALTH" | grep -q '"ready":true'
+
+          echo "Container replacement and persistent database continuity verification PASSED!"
           docker stop priceradar-ci-restarted
           docker rm priceradar-ci-restarted

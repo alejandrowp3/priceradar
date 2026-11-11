@@ -22,6 +22,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
     dbPath = path.join(tempDir, "private-history.sqlite");
     statusFilePath = path.join(tempDir, "scheduler-status.json");
     process.env.PRICERADAR_SQLITE_PATH = dbPath;
+    process.env.RAILWAY_VOLUME_MOUNT_PATH = tempDir;
   });
 
   afterEach(() => {
@@ -30,11 +31,12 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
   });
 
   describe("F7-10: Positive Scheduler Evidence Verification in Cloud Mode", () => {
-    const cloudEnv: NodeJS.ProcessEnv = {
+    const getCloudEnv = (): NodeJS.ProcessEnv => ({
       PRICERADAR_ENV: "cloud",
       RAILWAY_ENVIRONMENT: "production",
       RAILWAY_VOLUME_NAME: "priceradar-data",
-    };
+      RAILWAY_VOLUME_MOUNT_PATH: tempDir,
+    });
 
     it("Case 1: Actively running scheduler with fresh heartbeat reports healthy (ready: true, HTTP 200)", async () => {
       // Create fresh valid scheduler status file
@@ -52,7 +54,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       );
 
       const readiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         nowMs: now,
       });
 
@@ -62,7 +64,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(readiness.reason).toBeUndefined();
 
       // Test HTTP /api/health endpoint
-      Object.assign(process.env, cloudEnv);
+      Object.assign(process.env, getCloudEnv());
       const res = await healthRoute();
       expect(res.status).toBe(200);
       const json = await res.json();
@@ -80,7 +82,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
 
       // Beyond startup grace period
       const readiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         uptimeMs: 30_000,
         startupGracePeriodMs: 10_000,
       });
@@ -92,7 +94,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       );
 
       // Verify HTTP /api/health returns 503
-      Object.assign(process.env, cloudEnv);
+      Object.assign(process.env, getCloudEnv());
       const res = await healthRoute();
       expect(res.status).toBe(503);
       const json = await res.json();
@@ -115,7 +117,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       );
 
       const readiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         nowMs: now,
       });
 
@@ -123,7 +125,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(readiness.schedulerReady).toBe(false);
       expect(readiness.reason).toContain("Scheduler is explicitly stopped or inactive");
 
-      Object.assign(process.env, cloudEnv);
+      Object.assign(process.env, getCloudEnv());
       const res = await healthRoute();
       expect(res.status).toBe(503);
     });
@@ -144,7 +146,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       );
 
       const readiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         nowMs: now,
         freshnessThresholdMs: 90_000,
       });
@@ -153,7 +155,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(readiness.schedulerReady).toBe(false);
       expect(readiness.reason).toContain("Scheduler heartbeat is stale or inactive");
 
-      Object.assign(process.env, cloudEnv);
+      Object.assign(process.env, getCloudEnv());
       const res = await healthRoute();
       expect(res.status).toBe(503);
     });
@@ -162,7 +164,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       fs.writeFileSync(statusFilePath, "NOT_VALID_JSON{{{ corrupted content", "utf-8");
 
       const readiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         uptimeMs: 30_000,
         startupGracePeriodMs: 10_000,
       });
@@ -173,7 +175,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
         "Missing scheduler status: no active scheduler process found",
       );
 
-      Object.assign(process.env, cloudEnv);
+      Object.assign(process.env, getCloudEnv());
       const res = await healthRoute();
       expect(res.status).toBe(503);
     });
@@ -194,7 +196,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       );
 
       const readiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         nowMs: now,
         maxFutureToleranceMs: 5_000,
       });
@@ -203,7 +205,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(readiness.schedulerReady).toBe(false);
       expect(readiness.reason).toContain("future-dated (clock skew or invalid state)");
 
-      Object.assign(process.env, cloudEnv);
+      Object.assign(process.env, getCloudEnv());
       const res = await healthRoute();
       expect(res.status).toBe(503);
     });
@@ -211,7 +213,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
     it("Case 7: Initial startup window behavior and prevention of readiness deadlock", async () => {
       // 7a. Within startup grace window when scheduler is still booting (no status file yet)
       const bootingReadiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         uptimeMs: 3_000, // Process just booted 3s ago
         startupGracePeriodMs: 10_000,
       });
@@ -236,7 +238,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       );
 
       const initialStartupReadiness = checkSystemReadiness({
-        env: { ...process.env, ...cloudEnv },
+        env: { ...process.env, ...getCloudEnv() },
         nowMs: now,
       });
 
@@ -246,7 +248,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(initialStartupReadiness.schedulerReady).toBe(true);
 
       // Verify HTTP /api/health succeeds without deadlock on initial startup
-      Object.assign(process.env, cloudEnv);
+      Object.assign(process.env, getCloudEnv());
       const res = await healthRoute();
       expect(res.status).toBe(200);
     });
@@ -260,7 +262,9 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
         RAILWAY_ENVIRONMENT: "production",
       };
       delete ephemeralEnv.RAILWAY_VOLUME_NAME;
+      delete ephemeralEnv.RAILWAY_VOLUME_MOUNT_PATH;
       delete ephemeralEnv.PRICERADAR_VOLUME_NAME;
+      delete ephemeralEnv.PRICERADAR_VOLUME_MOUNT_PATH;
       delete ephemeralEnv.PRICERADAR_PERSISTENCE_TIER;
 
       const storageResult = checkStorageReadiness({ env: ephemeralEnv });
@@ -268,13 +272,13 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(storageResult.persistenceVerified).toBe(false);
       expect(storageResult.persistenceTier).toBe("UNVERIFIED_EPHEMERAL_FILESYSTEM");
       expect(storageResult.reason).toContain(
-        "Railway deployment detected without attached persistent volume",
+        "Railway deployment detected without RAILWAY_VOLUME_MOUNT_PATH",
       );
 
       const systemResult = checkSystemReadiness({ env: ephemeralEnv });
       expect(systemResult.ready).toBe(false);
       expect(systemResult.reason).toContain(
-        "Railway deployment detected without attached persistent volume",
+        "Railway deployment detected without RAILWAY_VOLUME_MOUNT_PATH",
       );
 
       // HTTP /api/health must reject unverified ephemeral storage with HTTP 503
@@ -289,20 +293,23 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
         PRICERADAR_ENV: "cloud",
         RAILWAY_ENVIRONMENT: "production",
         RAILWAY_VOLUME_NAME: "priceradar-data",
+        RAILWAY_VOLUME_MOUNT_PATH: tempDir,
       };
 
       const storageResult = checkStorageReadiness({ env: railwayEnv });
       expect(storageResult.ready).toBe(true);
       expect(storageResult.persistenceVerified).toBe(true);
       expect(storageResult.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(storageResult.evidenceType).toBe("RAILWAY_PLATFORM_MOUNT");
       expect(storageResult.volumeMarker?.volumeName).toBe("priceradar-data");
 
-      // Verify telemetry endpoint exposes persistenceTier and volumeMarker
+      // Verify telemetry endpoint exposes persistenceTier, evidenceType, and volumeMarker
       Object.assign(process.env, railwayEnv);
       const res = await telemetryRoute();
       expect(res.status).toBe(200);
       const json = await res.json();
       expect(json.storageReadiness.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(json.storageReadiness.evidenceType).toBe("RAILWAY_PLATFORM_MOUNT");
       expect(json.storageReadiness.persistenceVerified).toBe(true);
       expect(json.storageReadiness.volumeMarker.volumeId).toBeDefined();
     });
@@ -313,6 +320,7 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
         PRICERADAR_ENV: "cloud",
         RAILWAY_ENVIRONMENT: "production",
         RAILWAY_VOLUME_NAME: "priceradar-data",
+        RAILWAY_VOLUME_MOUNT_PATH: tempDir,
       };
 
       // --- Container 1 Lifecycle ---
@@ -320,6 +328,8 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(initStorage.persistenceVerified).toBe(true);
       const volumeMarkerId = initStorage.volumeMarker?.volumeId;
       expect(volumeMarkerId).toBeDefined();
+      expect(initStorage.isExistingMarker).toBe(false);
+      expect(initStorage.restartProofVerified).toBe(false);
 
       const repo1 = new SqlitePrivateHistoryRepository(dbPath);
       const listing: DiscoveredListing = {
@@ -392,12 +402,24 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       expect(summary1.counts.totalDistinctProducts).toBe(1);
       expect(summary1.counts.totalActiveObservations).toBe(1);
 
+      // Record exact identities, counts, and prices before replacement
+      const recordedIdentity = {
+        externalProductId: "prod-cloud-survive-001",
+        externalVariantId: "var-001",
+        productName: "Durable Cloud Product",
+        brand: "Test Brand",
+        observedPriceCop: 25000,
+        observationCount: 1,
+      };
+
       // Simulate Container 1 termination: close SQLite connection and discard instance
       repo1.close();
 
       // --- Container 2 Lifecycle (Replacement Container Attaching Same Persistent Volume) ---
       const reconnectedStorage = checkStorageReadiness({ env: volumeEnv });
       expect(reconnectedStorage.persistenceVerified).toBe(true);
+      expect(reconnectedStorage.isExistingMarker).toBe(true);
+      expect(reconnectedStorage.restartProofVerified).toBe(true);
       // Volume marker was preserved with exact same volumeId
       expect(reconnectedStorage.volumeMarker?.volumeId).toBe(volumeMarkerId);
 
@@ -405,21 +427,35 @@ describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
       const repo2 = new SqlitePrivateHistoryRepository(dbPath, { readOnly: true });
       const summary2 = repo2.getDashboardSummary();
 
-      // Verify 100% data fidelity: counts and identities survived unchanged
-      expect(summary2.counts.totalDistinctProducts).toBe(1);
-      expect(summary2.counts.totalActiveObservations).toBe(1);
+      // Verify exact persisted counts survived container replacement
+      expect(summary2.counts.totalDistinctProducts).toBe(
+        recordedIdentity.observationCount,
+      );
+      expect(summary2.counts.totalActiveObservations).toBe(
+        recordedIdentity.observationCount,
+      );
+      // F7-11C: Confirm the replacement process did NOT silently recreate an empty database!
+      expect(summary2.counts.totalActiveObservations).toBeGreaterThan(0);
 
       const { items: products } = repo2.listCatalogProducts();
       expect(products).toHaveLength(1);
-      expect(products[0]?.externalProductId).toBe("prod-cloud-survive-001");
-      expect(products[0]?.productName).toBe("Durable Cloud Product");
+      expect(products[0]?.externalProductId).toBe(recordedIdentity.externalProductId);
+      expect(products[0]?.externalVariantId).toBe(recordedIdentity.externalVariantId);
+      expect(products[0]?.productName).toBe(recordedIdentity.productName);
+      expect(products[0]?.brand).toBe(recordedIdentity.brand);
+      expect(products[0]?.latestPriceCop).toBe(recordedIdentity.observedPriceCop);
 
       const productKey = products[0]?.productVariantKey ?? "";
       expect(productKey).not.toBe("");
       const productDetail = repo2.getProductDetail(productKey);
       expect(productDetail).toBeDefined();
       expect(productDetail?.observations).toHaveLength(1);
-      expect(productDetail?.observations[0]?.observedPriceCop).toBe(25000);
+      expect(productDetail?.observations[0]?.observedPriceCop).toBe(
+        recordedIdentity.observedPriceCop,
+      );
+
+      // F7-11C: Confirm storage readiness remains healthy
+      expect(reconnectedStorage.ready).toBe(true);
 
       repo2.close();
     });

@@ -16,6 +16,7 @@ import type {
   ProductDetailView,
   PersistedScanRunRow,
   PersistenceTier,
+  PersistenceEvidenceType,
   VolumeMarkerInfo,
 } from "@priceradar/database";
 
@@ -48,6 +49,9 @@ export interface StorageReadinessResult {
   readonly dbExists: boolean;
   readonly persistenceTier: PersistenceTier;
   readonly persistenceVerified: boolean;
+  readonly evidenceType?: PersistenceEvidenceType;
+  readonly restartProofVerified?: boolean;
+  readonly isExistingMarker?: boolean;
   readonly volumeMarker?: VolumeMarkerInfo | null;
   readonly reason?: string;
 }
@@ -100,6 +104,9 @@ export function checkStorageReadiness(options?: {
       dbExists: fs.existsSync(dbPath),
       persistenceTier: persistenceContract.persistenceTier,
       persistenceVerified: false,
+      evidenceType: persistenceContract.evidenceType,
+      restartProofVerified: persistenceContract.restartProofVerified,
+      isExistingMarker: persistenceContract.isExistingMarker,
       volumeMarker: persistenceContract.volumeMarker,
       ...(persistenceContract.reason ? { reason: persistenceContract.reason } : {}),
     };
@@ -117,6 +124,9 @@ export function checkStorageReadiness(options?: {
       dbExists: false,
       persistenceTier: persistenceContract.persistenceTier,
       persistenceVerified: true,
+      evidenceType: persistenceContract.evidenceType,
+      restartProofVerified: persistenceContract.restartProofVerified,
+      isExistingMarker: persistenceContract.isExistingMarker,
       volumeMarker: persistenceContract.volumeMarker,
     };
   }
@@ -133,6 +143,9 @@ export function checkStorageReadiness(options?: {
         dbExists: true,
         persistenceTier: persistenceContract.persistenceTier,
         persistenceVerified: true,
+        evidenceType: persistenceContract.evidenceType,
+        restartProofVerified: persistenceContract.restartProofVerified,
+        isExistingMarker: persistenceContract.isExistingMarker,
         volumeMarker: persistenceContract.volumeMarker,
         reason: "Failed to open read-only database repository.",
       };
@@ -146,6 +159,9 @@ export function checkStorageReadiness(options?: {
       dbExists: true,
       persistenceTier: persistenceContract.persistenceTier,
       persistenceVerified: true,
+      evidenceType: persistenceContract.evidenceType,
+      restartProofVerified: persistenceContract.restartProofVerified,
+      isExistingMarker: persistenceContract.isExistingMarker,
       volumeMarker: persistenceContract.volumeMarker,
     };
   } catch (err: unknown) {
@@ -157,6 +173,9 @@ export function checkStorageReadiness(options?: {
       dbExists: true,
       persistenceTier: persistenceContract.persistenceTier,
       persistenceVerified: true,
+      evidenceType: persistenceContract.evidenceType,
+      restartProofVerified: persistenceContract.restartProofVerified,
+      isExistingMarker: persistenceContract.isExistingMarker,
       volumeMarker: persistenceContract.volumeMarker,
       reason: `Database file at '${dbPath}' is unreadable or corrupt: ${err instanceof Error ? err.message : String(err)}`,
     };
