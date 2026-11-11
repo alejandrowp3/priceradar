@@ -1,38 +1,21 @@
 import { NextResponse } from "next/server";
-import { getReadOnlyDatabase } from "../../../lib/db";
+import { checkSystemReadiness } from "../../../lib/db";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Public readiness probe endpoint (`F7-02`):
+ * Public readiness probe endpoint (`F7-02`, `F7-08`):
  * - Returns only minimal fields ({ status: "healthy", ready: true }).
  * - Exposes zero absolute filesystem paths, session data, or operational history.
- * - Returns HTTP 503 if required dependencies are genuinely broken or unreadable.
+ * - Returns HTTP 503 if persistent storage is missing, unmounted, read-only, or corrupted.
+ * - Returns HTTP 503 if scheduler heartbeat is stale in cloud mode.
+ * - Distinguishes legitimate first-time deployment initialization (returns 200).
  * - Compatible with cloud platform healthcheck probes (Railway, Render).
  */
 export async function GET(): Promise<NextResponse> {
-  try {
-    const { repo, dbExists } = getReadOnlyDatabase();
+  const readiness = checkSystemReadiness();
 
-    // If database exists on disk, verify read capability
-    if (dbExists && repo) {
-      // Simple lightweight query to verify SQLite integrity
-      repo.getDashboardSummary();
-    }
-
-    return NextResponse.json(
-      {
-        status: "healthy",
-        ready: true,
-      },
-      {
-        status: 200,
-        headers: {
-          "cache-control": "no-store, max-age=0",
-        },
-      },
-    );
-  } catch {
+  if (!readiness.ready) {
     return NextResponse.json(
       {
         status: "unhealthy",
@@ -46,4 +29,17 @@ export async function GET(): Promise<NextResponse> {
       },
     );
   }
+
+  return NextResponse.json(
+    {
+      status: "healthy",
+      ready: true,
+    },
+    {
+      status: 200,
+      headers: {
+        "cache-control": "no-store, max-age=0",
+      },
+    },
+  );
 }

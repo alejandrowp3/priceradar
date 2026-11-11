@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import type { DiscoveredListing } from "@priceradar/domain";
+import { createCopAmount } from "@priceradar/domain";
 import { SqlitePrivateHistoryRepository } from "@priceradar/database";
 import { fetchSchedulerStatus } from "../../../apps/web/src/lib/db";
 import { CloudScheduler } from "../src/cloud-scheduler";
@@ -218,6 +220,199 @@ describe("Cloud Scheduler (P5 Cloud-First Milestone 1)", () => {
     const result2 = await scheduler2.executeScheduledScan();
     expect(result2).not.toBeNull();
     expect(result2?.persisted).toBe(true);
+  });
+
+  it("F7-09: renewWorkerLock extends active lease and rejects unauthorized or expired renewals", () => {
+    const repo = new SqlitePrivateHistoryRepository(dbPath);
+    const t0 = new Date("2026-11-11T12:00:00.000Z");
+    const t0Iso = t0.toISOString();
+
+    // 1. Acquire initial lock for 60 seconds
+    const acquired = repo.acquireWorkerLock(
+      "cloud-scheduler:test-lock",
+      "holder-alpha",
+      60_000,
+      t0Iso,
+    );
+    expect(acquired).toBe(true);
+    expect(
+      repo.isWorkerLockHeldBy("cloud-scheduler:test-lock", "holder-alpha", t0Iso),
+    ).toBe(true);
+    expect(
+      repo.isWorkerLockHeldBy("cloud-scheduler:test-lock", "holder-beta", t0Iso),
+    ).toBe(false);
+
+    // 2. Renew after 30 seconds (still within 60s TTL)
+    const t30Iso = new Date(t0.getTime() + 30_000).toISOString();
+    const renewed = repo.renewWorkerLock(
+      "cloud-scheduler:test-lock",
+      "holder-alpha",
+      60_000,
+      t30Iso,
+    );
+    expect(renewed).toBe(true);
+
+    // Lock is now extended to t0 + 30s + 60s = t0 + 90s
+    const t80Iso = new Date(t0.getTime() + 80_000).toISOString();
+    expect(
+      repo.isWorkerLockHeldBy("cloud-scheduler:test-lock", "holder-alpha", t80Iso),
+    ).toBe(true);
+
+    // 3. Unauthorized renewal attempt by different holder fails
+    const unauthorizedRenew = repo.renewWorkerLock(
+      "cloud-scheduler:test-lock",
+      "holder-beta",
+      60_000,
+      t80Iso,
+    );
+    expect(unauthorizedRenew).toBe(false);
+
+    // 4. Renewal attempt after expiry (at t0 + 100s) fails
+    const t100Iso = new Date(t0.getTime() + 100_000).toISOString();
+    expect(
+      repo.isWorkerLockHeldBy("cloud-scheduler:test-lock", "holder-alpha", t100Iso),
+    ).toBe(false);
+
+    const expiredRenew = repo.renewWorkerLock(
+      "cloud-scheduler:test-lock",
+      "holder-alpha",
+      60_000,
+      t100Iso,
+    );
+    expect(expiredRenew).toBe(false);
+
+    repo.close();
+  });
+
+  it("F7-09: crash recovery allows new worker to acquire lock after lease TTL expires", () => {
+    const repo = new SqlitePrivateHistoryRepository(dbPath);
+    const t0 = new Date("2026-11-11T12:00:00.000Z");
+
+    // Worker 1 acquires lock for 30s and crashes without releasing
+    repo.acquireWorkerLock(
+      "cloud-scheduler:test-lock",
+      "crashed-worker",
+      30_000,
+      t0.toISOString(),
+    );
+
+    // At t + 10s, Worker 2 cannot acquire
+    const t10Iso = new Date(t0.getTime() + 10_000).toISOString();
+    expect(
+      repo.acquireWorkerLock(
+        "cloud-scheduler:test-lock",
+        "survivor-worker",
+        30_000,
+        t10Iso,
+      ),
+    ).toBe(false);
+
+    // At t + 35s (after TTL expires), Worker 2 successfully recovers and acquires lock
+    const t35Iso = new Date(t0.getTime() + 35_000).toISOString();
+    expect(
+      repo.acquireWorkerLock(
+        "cloud-scheduler:test-lock",
+        "survivor-worker",
+        30_000,
+        t35Iso,
+      ),
+    ).toBe(true);
+
+    expect(
+      repo.isWorkerLockHeldBy("cloud-scheduler:test-lock", "survivor-worker", t35Iso),
+    ).toBe(true);
+    expect(
+      repo.isWorkerLockHeldBy("cloud-scheduler:test-lock", "crashed-worker", t35Iso),
+    ).toBe(false);
+
+    repo.close();
+  });
+
+  it("F7-09: persistApprovedInspectionBatch aborts and rolls back if requiredWorkerLock is lost", () => {
+    const repo = new SqlitePrivateHistoryRepository(dbPath);
+    const lockKey = "cloud-scheduler:persist-lock";
+    const holderId = "valid-holder";
+
+    // Acquire lock with short TTL (100ms)
+    repo.acquireWorkerLock(lockKey, holderId, 100);
+
+    // Force expiration by releasing or expiring
+    repo.releaseWorkerLock(lockKey, holderId);
+
+    const testListing: DiscoveredListing = {
+      providerId: "rappi-authenticated-inspector",
+      store: {
+        providerId: "rappi-authenticated-inspector",
+        externalStoreId: "900130995-turbo-super",
+        name: "Turbo Super",
+        categorySlug: "supermercados",
+      },
+      variant: {
+        externalProductId: "prod-test-99",
+        externalVariantId: "prod-test-99-std",
+        name: "Test Product",
+        brand: "Test Brand",
+        categorySlug: "supermercados",
+        categoryName: "Supermercados",
+        packagingLabel: "1 unidad",
+        unitQuantity: 1,
+        unitType: "unit" as const,
+        productUrl: "https://www.rappi.com.co/p/prod-test-99",
+      },
+      geographicContext: {
+        countryCode: "CO",
+        citySlug: "bogota",
+        cityName: "Bogotá D.C.",
+      },
+      observedPriceCop: createCopAmount(25000),
+      availability: "IN_STOCK" as const,
+      provenance: "DEMO_FIXTURE" as const,
+      sourceObservedAt: new Date().toISOString(),
+    };
+
+    const context = {
+      scanRunId: "test-scan-lock-fail",
+      observedAtIso: new Date().toISOString(),
+      gateStatus: "VERIFIED_ACTIVE_SELECTION" as const,
+      hasSecurityChallenge: false,
+      isLoginRequired: false,
+      isDeliveryContextVerified: false,
+      citySlug: "bogota",
+      cityName: "Bogotá D.C. (Demo)",
+      fulfillmentContextHash: "ctx-88be5762563932c5",
+      activeAddressSelection: "UNVERIFIED_SESSION_DEFAULT",
+      cityAndNeighborhoodMetadata: "SYNTHETIC_DEMO_CONTEXT",
+      servingStoreBranch: "DEMO_FIXTURE_STORE",
+      productCatalogContext: "SYNTHETIC_DEMO_CATALOG",
+      pricingVerificationVerdict: "UNVERIFIED_DEMO_FIXTURE" as const,
+      navigationStates: {
+        ADDRESS_SELECTED: false,
+        STORE_OPENED_FROM_ADDRESS_CONTEXT: false,
+        CATALOG_VISIBLE_IN_SESSION: true,
+        ADDRESS_SPECIFIC_PRICING_VERIFIED: false,
+      },
+      candidatesDiscoveredCount: 1,
+      skippedMalformedCount: 0,
+      duplicateSuppressedCount: 0,
+      listings: [testListing],
+      isDemoFixture: true,
+    };
+
+    // Attempt persistence with requiredWorkerLock that is not held
+    const result = repo.persistApprovedInspectionBatch(context, {
+      ownerConfirmed: true,
+      requiredWorkerLock: { lockKey, holderId },
+    });
+
+    expect(result.persisted).toBe(false);
+    expect(result.reason).toBe("TRANSACTION_FAILED");
+    expect(result.errorSummary).toContain("Worker lock");
+
+    // Verify nothing was written to database
+    const runs = repo.listRecentScanRuns(5);
+    expect(runs.some((r) => r.scanRunId === "test-scan-lock-fail")).toBe(false);
+
+    repo.close();
   });
 
   it("starts and stops cleanly without leaving dangling timers", async () => {

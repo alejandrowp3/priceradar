@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
- * Verification script for PriceRadar P5 Cloud Container Configuration (`F7-04`).
- * Validates container architecture, Dockerfile directives, fail-closed auth, and Chromium readiness contracts.
- * Runs in CI and local test environments without requiring a local Docker daemon.
+ * Static configuration verification for PriceRadar P5 Cloud Container (`F7-04`, `F7-09`).
+ * NOTE: This script performs fast static verification of Dockerfile, railway.json, entrypoint,
+ * and fail-closed configurations without requiring a local Docker daemon.
+ * Live container runtime execution (Chromium headless boot, Next.js web startup, and persistent volume mount)
+ * is executed reproducibly in GitHub Actions CI (`.github/workflows/ci.yml`).
  */
 
 import fs from "node:fs";
@@ -13,7 +15,10 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = path.resolve(scriptDir, "..");
 
 console.log("================================================================");
-console.log("PriceRadar Cloud Container Verification (F7-04)");
+console.log(
+  "PriceRadar Cloud Container Static Configuration Verification (F7-04, F7-09)",
+);
+console.log("(Note: Live container runtime tests execute in CI via Docker)");
 console.log("================================================================");
 
 let failureCount = 0;
@@ -98,7 +103,7 @@ if (fs.existsSync(entrypointPath)) {
   );
 }
 
-// 4. Cloud scheduler worker lock & heartbeat check
+// 4. Cloud scheduler worker lock, lease renewal & heartbeat check (F7-06, F7-09)
 const schedulerPath = path.join(
   workspaceRoot,
   "apps",
@@ -119,9 +124,33 @@ if (fs.existsSync(schedulerPath)) {
     schedulerContent.includes("acquireWorkerLock"),
   );
   assertCondition(
+    "Cloud scheduler implements active lease renewal (renewWorkerLock)",
+    schedulerContent.includes("renewWorkerLock"),
+  );
+  assertCondition(
+    "Cloud scheduler verifies lock ownership before persistence (isWorkerLockHeldBy)",
+    schedulerContent.includes("isWorkerLockHeldBy"),
+  );
+  assertCondition(
     "Cloud scheduler explicitly marks synthetic demo data with DEMO_FIXTURE and UNVERIFIED_DEMO_FIXTURE",
     schedulerContent.includes("UNVERIFIED_DEMO_FIXTURE") &&
       schedulerContent.includes("SYNTHETIC_DEMO_CONTEXT"),
+  );
+}
+
+// 5. Railway configuration check (F7-09)
+const railwayConfigPath = path.join(workspaceRoot, "railway.json");
+assertCondition(
+  "railway.json exists at workspace root",
+  fs.existsSync(railwayConfigPath),
+);
+
+if (fs.existsSync(railwayConfigPath)) {
+  const railwayContent = fs.readFileSync(railwayConfigPath, "utf-8");
+  const railwayJson = JSON.parse(railwayContent);
+  assertCondition(
+    "railway.json sets numReplicas to 1 in deploy configuration",
+    railwayJson.deploy?.numReplicas === 1,
   );
 }
 
@@ -130,6 +159,6 @@ if (failureCount > 0) {
   console.error(`Verification FAILED with ${failureCount} issue(s).`);
   process.exit(1);
 } else {
-  console.log("Verification PASSED: All cloud container invariants verified.");
+  console.log("Verification PASSED: All cloud container static invariants verified.");
   process.exit(0);
 }

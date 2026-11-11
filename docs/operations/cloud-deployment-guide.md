@@ -16,7 +16,7 @@ This guide describes how to deploy PriceRadar to **Railway** in under 5 minutes 
 1. Open your browser and log into [Railway Dashboard](https://railway.com/dashboard).
 2. Click **+ New Project** -> Select **Deploy from GitHub repo**.
 3. Choose the repository `alejandrowp3/priceradar`.
-4. Railway will automatically detect the `Dockerfile` at the root of the repository.
+4. Railway will automatically detect the `Dockerfile` and `railway.json` at the root of the repository, applying `numReplicas: 1` and the configured `/api/health` healthcheck probe.
 
 ---
 

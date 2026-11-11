@@ -17,6 +17,8 @@ export interface CloudSchedulerOptions {
   readonly scanOnStartup?: boolean;
   readonly statusFilePath?: string;
   readonly logger?: (message: string) => void;
+  readonly leaseTtlMs?: number;
+  readonly leaseRenewalIntervalMs?: number;
 }
 
 export interface CloudSchedulerStatus {
@@ -42,6 +44,8 @@ export class CloudScheduler {
   private readonly scanOnStartup: boolean;
   private readonly statusFilePath: string;
   private readonly logger: (message: string) => void;
+  private readonly leaseTtlMs: number;
+  private readonly leaseRenewalIntervalMs: number;
   private timer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private isScanning = false;
@@ -75,6 +79,9 @@ export class CloudScheduler {
       ((msg: string) => {
         console.log(`[CloudScheduler] ${msg}`);
       });
+    this.leaseTtlMs = options.leaseTtlMs ?? 60_000;
+    this.leaseRenewalIntervalMs =
+      options.leaseRenewalIntervalMs ?? Math.max(5_000, Math.floor(this.leaseTtlMs / 4));
   }
 
   public getStatus(): CloudSchedulerStatus {
@@ -196,6 +203,8 @@ export class CloudScheduler {
     const lockKey = "cloud-scheduler:leader-scan-lock";
     let repo: SqlitePrivateHistoryRepository | null = null;
     let lockAcquired = false;
+    let renewalTimer: NodeJS.Timeout | null = null;
+    let lockOwnershipLost = false;
 
     try {
       this.logger(`Starting scheduled collection run '${scanRunId}'...`);
@@ -208,8 +217,8 @@ export class CloudScheduler {
 
       repo = new SqlitePrivateHistoryRepository(this.dbPath);
 
-      // F7-06: Acquire multi-replica worker lock (10 minutes lease TTL)
-      lockAcquired = repo.acquireWorkerLock(lockKey, scanRunId, 10 * 60 * 1000, nowIso);
+      // F7-06 & F7-09: Acquire multi-replica worker lock with renewable lease TTL
+      lockAcquired = repo.acquireWorkerLock(lockKey, scanRunId, this.leaseTtlMs, nowIso);
       if (!lockAcquired) {
         this.logger(
           `Another worker holds scheduler lock '${lockKey}'. Skipping this scan cycle (SKIPPED_LOCKED).`,
@@ -219,6 +228,25 @@ export class CloudScheduler {
         this.writeStatusFile();
         return null;
       }
+
+      // F7-09: Active lease renewal timer during long scanning operations
+      renewalTimer = setInterval(() => {
+        if (!repo) return;
+        try {
+          const renewed = repo.renewWorkerLock(lockKey, scanRunId, this.leaseTtlMs);
+          if (!renewed) {
+            lockOwnershipLost = true;
+            this.logger(
+              `WARNING: Worker lock '${lockKey}' for '${scanRunId}' could not be renewed (ownership lost or expired).`,
+            );
+          }
+        } catch (err: unknown) {
+          lockOwnershipLost = true;
+          this.logger(
+            `ERROR: Failed to renew worker lock '${lockKey}': ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }, this.leaseRenewalIntervalMs);
 
       const provider = new FixtureCatalogProvider();
 
@@ -236,6 +264,13 @@ export class CloudScheduler {
       }
 
       this.simulationStep = (this.simulationStep + 1) % 3;
+
+      // F7-09: Guard against lease expiration/theft prior to attempting persistence
+      if (lockOwnershipLost || !repo.isWorkerLockHeldBy(lockKey, scanRunId)) {
+        throw new Error(
+          `Worker lock '${lockKey}' was lost or expired during scan run '${scanRunId}'. Persistence aborted.`,
+        );
+      }
 
       // F7-03: Explicitly synthetic demo context and unverified demo verdict
       const context: SupervisedPersistenceContextInput = {
@@ -274,6 +309,10 @@ export class CloudScheduler {
 
       const persistResult = repo.persistApprovedInspectionBatch(context, {
         ownerConfirmed: true,
+        requiredWorkerLock: {
+          lockKey,
+          holderId: scanRunId,
+        },
       });
 
       this.totalScansExecuted += 1;
@@ -296,6 +335,9 @@ export class CloudScheduler {
       this.writeStatusFile();
       return null;
     } finally {
+      if (renewalTimer) {
+        clearInterval(renewalTimer);
+      }
       if (repo) {
         if (lockAcquired) {
           try {

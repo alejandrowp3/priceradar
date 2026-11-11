@@ -67,3 +67,76 @@ jobs:
 
       - name: Run production build
         run: pnpm build
+
+      - name: Verify cloud container static configuration (F7-04, F7-09)
+        run: pnpm verify:container
+
+  container-runtime:
+    name: Container Build & Runtime Verification (F7-04, F7-07, F7-08)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Build production container image
+        run: docker build -t priceradar-cloud:ci .
+
+      - name: Verify headless Chromium launch in container (F7-04)
+        run: |
+          docker run --rm priceradar-cloud:ci node --experimental-strip-types apps/worker/src/chromium-readiness.ts
+
+      - name: Verify cloud container runtime startup, storage mount, and fail-closed auth
+        run: |
+          mkdir -p /tmp/priceradar-ci-data
+          docker run -d \
+            --name priceradar-ci \
+            -p 4178:4178 \
+            -v /tmp/priceradar-ci-data:/data \
+            -e PRICERADAR_ENV=cloud \
+            -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
+            -e PRICERADAR_SQLITE_PATH=/data/private-history.sqlite \
+            -e PRICERADAR_SCAN_ON_STARTUP=true \
+            priceradar-cloud:ci
+
+          echo "Waiting for container startup and health probe..."
+          for i in $(seq 1 30); do
+            if curl -s -f http://127.0.0.1:4178/api/health | grep -q '"status":"healthy"'; then
+              echo "Container health probe passed after ${i}s."
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Verifying public health probe returns 200 without auth..."
+          HEALTH_JSON=$(curl -s http://127.0.0.1:4178/api/health)
+          echo "$HEALTH_JSON" | grep -q '"status":"healthy"'
+          echo "$HEALTH_JSON" | grep -q '"ready":true'
+
+          echo "Verifying unauthenticated request to root fails closed with 401..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4178/)
+          if [ "$HTTP_CODE" != "401" ]; then
+            echo "ERROR: Expected HTTP 401 on unauthenticated root request, received $HTTP_CODE"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying authenticated request to root succeeds with 200..."
+          AUTH_HEADER="Authorization: Basic $(echo -n ":CiTestSecret123" | base64)"
+          AUTH_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "$AUTH_HEADER" http://127.0.0.1:4178/)
+          if [ "$AUTH_HTTP_CODE" != "200" ]; then
+            echo "ERROR: Expected HTTP 200 on authenticated root request, received $AUTH_HTTP_CODE"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying private telemetry endpoint..."
+          TELEMETRY_JSON=$(curl -s -H "$AUTH_HEADER" http://127.0.0.1:4178/api/telemetry)
+          echo "$TELEMETRY_JSON" | grep -q '"service":"priceradar-cloud"'
+
+          echo "Verifying persistent storage file was created in mounted volume..."
+          ls -la /tmp/priceradar-ci-data/
+
+          echo "Container runtime verification passed!"
+          docker stop priceradar-ci
+          docker rm priceradar-ci

@@ -207,4 +207,97 @@ describe("Web Dashboard Middleware Security (Local & Cloud Trust Boundary)", () 
     const res = middleware(req);
     expect(res.status).toBe(200);
   });
+
+  describe("F7-07: Host-Header-Based Loopback Authentication Exception Protection", () => {
+    it("F7-07: rejects forged Host: 127.0.0.1:4178 in cloud mode when unauthenticated", () => {
+      process.env.PRICERADAR_ENV = "cloud";
+      process.env.PRICERADAR_WEB_PASSWORD = "cloud-password-xyz";
+      process.env.PRICERADAR_ALLOWED_HOSTS = "127.0.0.1:4178,priceradar.up.railway.app";
+
+      // Attacker attempts to forge Host: 127.0.0.1:4178 to bypass auth
+      const forgedReq = new NextRequest("http://127.0.0.1:4178/", {
+        headers: {
+          host: "127.0.0.1:4178",
+        },
+      });
+      const res = middleware(forgedReq);
+      // In cloud mode, forged Host: 127.0.0.1 MUST NOT establish loopback trust!
+      expect(res.status).toBe(401);
+      expect(res.headers.get("www-authenticate")).toContain("Basic");
+    });
+
+    it("F7-07: rejects forged Host: localhost:4178 in cloud mode when unauthenticated", () => {
+      process.env.PRICERADAR_ENV = "cloud";
+      process.env.PRICERADAR_WEB_PASSWORD = "cloud-password-xyz";
+      process.env.PRICERADAR_ALLOWED_HOSTS = "localhost:4178,priceradar.up.railway.app";
+
+      const forgedReq = new NextRequest("http://localhost:4178/products", {
+        headers: {
+          host: "localhost:4178",
+        },
+      });
+      const res = middleware(forgedReq);
+      expect(res.status).toBe(401);
+    });
+
+    it("F7-07: fails closed in cloud mode even if PRICERADAR_WEB_PASSWORD is missing and Host is loopback", () => {
+      process.env.PRICERADAR_ENV = "cloud";
+      delete process.env.PRICERADAR_WEB_PASSWORD;
+      process.env.PRICERADAR_ALLOWED_HOSTS = "127.0.0.1:4178";
+
+      const forgedReq = new NextRequest("http://127.0.0.1:4178/opportunities", {
+        headers: {
+          host: "127.0.0.1:4178",
+        },
+      });
+      const res = middleware(forgedReq);
+      expect(res.status).toBe(401);
+    });
+
+    it("F7-07: fails closed when Next.js is started directly in production (NODE_ENV=production) without password", () => {
+      process.env.NODE_ENV = "production";
+      delete process.env.PRICERADAR_ENV;
+      delete process.env.PRICERADAR_WEB_PASSWORD;
+      process.env.PRICERADAR_ALLOWED_HOSTS = "127.0.0.1:4178";
+
+      // Direct Next.js production server startup without cloud-entrypoint
+      const req = new NextRequest("http://127.0.0.1:4178/", {
+        headers: {
+          host: "127.0.0.1:4178",
+        },
+      });
+      const res = middleware(req);
+      expect(res.status).toBe(401);
+    });
+
+    it("F7-07: fails closed when server is bound to 0.0.0.0 without password even in dev mode", () => {
+      process.env.NODE_ENV = "development";
+      delete process.env.PRICERADAR_ENV;
+      delete process.env.PRICERADAR_WEB_PASSWORD;
+      process.env.HOST = "0.0.0.0"; // Externally reachable server binding
+
+      const req = new NextRequest("http://127.0.0.1:4178/", {
+        headers: {
+          host: "127.0.0.1:4178",
+        },
+      });
+      const res = middleware(req);
+      expect(res.status).toBe(401);
+    });
+
+    it("F7-07: allows passwordless access ONLY on a genuinely loopback-bound server in local dev", () => {
+      process.env.NODE_ENV = "development";
+      delete process.env.PRICERADAR_ENV;
+      delete process.env.PRICERADAR_WEB_PASSWORD;
+      process.env.HOST = "127.0.0.1"; // Genuinely bound to loopback
+
+      const req = new NextRequest("http://127.0.0.1:4178/", {
+        headers: {
+          host: "127.0.0.1:4178",
+        },
+      });
+      const res = middleware(req);
+      expect(res.status).toBe(200);
+    });
+  });
 });

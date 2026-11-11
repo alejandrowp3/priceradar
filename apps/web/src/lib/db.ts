@@ -34,8 +34,155 @@ export interface CloudSchedulerStatusInfo {
 let cachedRepo: SqlitePrivateHistoryRepository | null = null;
 let cachedPath: string | null = null;
 
+export interface StorageReadinessResult {
+  readonly ready: boolean;
+  readonly isFirstTimeInit: boolean;
+  readonly storageDirExists: boolean;
+  readonly storageDirWritable: boolean;
+  readonly dbExists: boolean;
+  readonly reason?: string;
+}
+
+export interface SystemReadinessResult {
+  readonly ready: boolean;
+  readonly storage: StorageReadinessResult;
+  readonly schedulerReady: boolean;
+  readonly reason?: string;
+}
+
 export function getDatabasePath(): string {
   return process.env.PRICERADAR_SQLITE_PATH ?? DEFAULT_PRIVATE_SQLITE_DB_PATH;
+}
+
+/**
+ * Validates persistent storage readiness for cloud and local deployments (`F7-08`).
+ * - In cloud/production mode, mandatory persistent volume mount (/data) must exist and be writable.
+ * - Distinguishes legitimate first deployment initialization (mounted, writable, but DB not yet seeded)
+ *   from failed/missing volume mounts or read-only filesystems.
+ * - Verifies SQLite readability and schema integrity when database file exists.
+ */
+export function checkStorageReadiness(): StorageReadinessResult {
+  const dbPath = path.resolve(getDatabasePath());
+  const storageDir = path.dirname(dbPath);
+  const storageDirExists = fs.existsSync(storageDir);
+  let storageDirWritable = false;
+
+  if (storageDirExists) {
+    try {
+      fs.accessSync(storageDir, fs.constants.W_OK);
+      storageDirWritable = true;
+    } catch {
+      storageDirWritable = false;
+    }
+  }
+
+  // 1. Persistent storage directory must exist
+  if (!storageDirExists) {
+    return {
+      ready: false,
+      isFirstTimeInit: false,
+      storageDirExists: false,
+      storageDirWritable: false,
+      dbExists: false,
+      reason: `Storage directory does not exist at '${storageDir}'. Persistent volume mount missing.`,
+    };
+  }
+
+  // 2. Persistent storage directory must be writable
+  if (!storageDirWritable) {
+    return {
+      ready: false,
+      isFirstTimeInit: false,
+      storageDirExists: true,
+      storageDirWritable: false,
+      dbExists: false,
+      reason: `Storage directory at '${storageDir}' is not writable. Check mount permissions.`,
+    };
+  }
+
+  const dbExists = fs.existsSync(dbPath);
+
+  // 3. First-time initialization: storage volume is mounted and writable, but DB not yet created
+  if (!dbExists) {
+    return {
+      ready: true,
+      isFirstTimeInit: true,
+      storageDirExists,
+      storageDirWritable,
+      dbExists: false,
+    };
+  }
+
+  // 4. If database exists, verify SQLite readability and integrity
+  try {
+    const { repo } = getReadOnlyDatabase();
+    if (!repo) {
+      return {
+        ready: false,
+        isFirstTimeInit: false,
+        storageDirExists,
+        storageDirWritable,
+        dbExists: true,
+        reason: "Failed to open read-only database repository.",
+      };
+    }
+    repo.getDashboardSummary();
+    return {
+      ready: true,
+      isFirstTimeInit: false,
+      storageDirExists,
+      storageDirWritable,
+      dbExists: true,
+    };
+  } catch (err: unknown) {
+    return {
+      ready: false,
+      isFirstTimeInit: false,
+      storageDirExists,
+      storageDirWritable,
+      dbExists: true,
+      reason: `Database file at '${dbPath}' is unreadable or corrupt: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/**
+ * Checks system readiness combining storage integrity and scheduler health (`F7-08`).
+ */
+export function checkSystemReadiness(): SystemReadinessResult {
+  const storage = checkStorageReadiness();
+  if (!storage.ready) {
+    return {
+      ready: false,
+      storage,
+      schedulerReady: false,
+      ...(storage.reason ? { reason: storage.reason } : {}),
+    };
+  }
+
+  const isCloud =
+    process.env.PRICERADAR_ENV === "cloud" ||
+    Boolean(process.env.RAILWAY_ENVIRONMENT) ||
+    Boolean(process.env.RENDER);
+
+  if (isCloud) {
+    const schedulerStatus = fetchSchedulerStatus(90_000);
+    // If scheduler status reports stale heartbeat in cloud mode, system is not ready
+    if (schedulerStatus?.isStale) {
+      return {
+        ready: false,
+        storage,
+        schedulerReady: false,
+        reason: "Scheduler heartbeat is stale or inactive.",
+      };
+    }
+  }
+
+  return {
+    ready: true,
+    storage,
+    schedulerReady: true,
+  };
 }
 
 /**

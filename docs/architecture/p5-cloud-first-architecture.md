@@ -50,9 +50,16 @@ As clarified by the repository owner, **PriceRadar must be hosted in the cloud f
 - **Engine**: SQLite 3 with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`).
 - **Location**: `/data/private-history.sqlite` on a dedicated 5 GB persistent SSD volume mounted at `/data`.
 - **Repository Isolation**: `/data` is outside `/app` (the Git repository root), satisfying `assertDatabasePathOutsideRepository()`.
-- **Concurrency Model**:
+- **Storage Readiness & Lifecycle (`F7-08`)**:
+  - The readiness probe distinguishes first-time initialization (mounted and writable volume before the initial scan has executed) from an unmounted or inaccessible volume.
+  - If `/data` does not exist or is not writable, `/api/health` returns HTTP 503 without leaking filesystem paths.
+  - When the database file exists, read integrity is verified before reporting healthy.
+- **Concurrency Model & Distributed Lease Locks (`F7-06`, `F7-09`)**:
+  - `railway.json` sets `numReplicas: 1` ensuring a single active container instance.
   - Next.js Server Components instantiate `SqlitePrivateHistoryRepository` in strict read-only mode (`{ readOnly: true }`).
-  - The in-process `CloudScheduler` writes atomic inspection batches via `persistApprovedInspectionBatch(...)` with `ownerConfirmed: true`.
+  - The in-process `CloudScheduler` acquires an atomic worker lease lock (`acquireWorkerLock`) before starting a scan run.
+  - Long scans actively renew the lease (`renewWorkerLock`) on a periodic interval.
+  - `persistApprovedInspectionBatch` enforces `requiredWorkerLock` both before initiating mutations and immediately before committing the transaction; if lock ownership was lost or expired, the transaction is atomically rolled back to prevent split-brain writes.
   - WAL mode guarantees concurrent reads never block writes and writes never block reads.
 - **Snapshot Backups**: The worker can automatically copy `/data/private-history.sqlite` to `/data/backups/` periodically.
 
@@ -60,15 +67,18 @@ As clarified by the repository owner, **PriceRadar must be hosted in the cloud f
 
 ## 4. Remote Dashboard Access & Security Architecture
 
-1. **DNS Rebinding & Host Validation**:
+1. **DNS Rebinding & Host Validation (`F7-01`, `F7-07`)**:
    - `apps/web/src/middleware.ts` validates incoming `Host` headers against `PRICERADAR_ALLOWED_HOSTS` (e.g. `*.railway.app`, `priceradar-production.up.railway.app`).
+   - In cloud mode (`PRICERADAR_ENV=cloud` or `NODE_ENV=production`), client-provided loopback `Host` headers (such as `Host: 127.0.0.1:4178` or `Host: localhost:4178`) are never trusted to establish local loopback privileges.
+   - Passwordless access is strictly forbidden in cloud deployments and is limited to verified loopback-bound servers in local development.
    - Unauthorized host headers are rejected with HTTP 403.
-2. **Mandatory Remote Authentication**:
+2. **Mandatory Remote Authentication (`F7-01`, `F7-07`)**:
    - Configured via `PRICERADAR_WEB_PASSWORD`.
-   - When set, requests must supply valid HTTP Basic Auth credentials (`Authorization: Basic <base64>`).
+   - In cloud mode, authentication fails closed: missing, empty, or whitespace-only password configuration results in HTTP 401 on all protected routes and prevents cloud startup.
+   - When configured, requests must supply valid HTTP Basic Auth credentials (`Authorization: Basic <base64>`).
    - Unauthenticated requests receive HTTP 401 with `WWW-Authenticate: Basic realm="PriceRadar Private Dashboard"`, prompting the browser's native login modal.
-3. **Platform Health Check & Telemetry Separation**:
-   - `/api/health` is exempt from Basic Auth and provides a minimal public readiness probe (`{"status":"healthy","ready":true}`). It exposes zero filesystem paths, database names, fulfillment hashes, or scheduler timestamps.
+3. **Platform Health Check & Telemetry Separation (`F7-02`, `F7-08`)**:
+   - `/api/health` is exempt from Basic Auth and provides a minimal public readiness probe (`{"status":"healthy","ready":true}`). It exposes zero filesystem paths, database names, fulfillment hashes, or scheduler timestamps. In cloud mode, it returns HTTP 503 if storage is unmounted or if the scheduler heartbeat is stale.
    - `/api/telemetry` provides detailed operational KPIs and requires full authentication.
 
 ---

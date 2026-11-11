@@ -324,6 +324,15 @@ export interface PersistApprovedBatchOptions {
    * Optional fault injection hook for testing atomic transaction rollback on mid-batch failure.
    */
   readonly simulateCrashAfterObservationsInserted?: number;
+  /**
+   * Optional worker lock requirement for scheduled cloud executions (`F7-09`).
+   * If provided, verifies the lock is held prior to beginning mutations and immediately before committing.
+   * If the lock has expired or changed holders, the transaction is atomically aborted and rolled back.
+   */
+  readonly requiredWorkerLock?: {
+    readonly lockKey: string;
+    readonly holderId: string;
+  };
 }
 
 export interface PersistApprovedBatchResult {
@@ -1431,6 +1440,53 @@ export class SqlitePrivateHistoryRepository {
     }
   }
 
+  /**
+   * Renews an active distributed SQLite worker lease lock (`F7-09`).
+   * Extends the lease if and only if the lock is currently held by holderId and has not yet expired.
+   * Returns true if renewal succeeded, false if lock expired or was acquired by another worker.
+   */
+  public renewWorkerLock(
+    lockKey: string,
+    holderId: string,
+    ttlMs: number,
+    nowIso: string = new Date().toISOString(),
+  ): boolean {
+    this.assertWritable("renewWorkerLock");
+    try {
+      const nowMs = Date.parse(nowIso);
+      const newExpiresAtIso = new Date(nowMs + ttlMs).toISOString();
+      const res = this.db
+        .prepare(
+          "UPDATE worker_locks SET expires_at = ? WHERE lock_key = ? AND holder_id = ? AND expires_at > ?",
+        )
+        .run(newExpiresAtIso, lockKey, holderId, nowIso);
+      return Number(res.changes) > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Checks whether a worker lock is currently held and unexpired by holderId (`F7-09`).
+   * Safe to call on read-only or read-write databases.
+   */
+  public isWorkerLockHeldBy(
+    lockKey: string,
+    holderId: string,
+    nowIso: string = new Date().toISOString(),
+  ): boolean {
+    try {
+      const row = this.db
+        .prepare(
+          "SELECT 1 FROM worker_locks WHERE lock_key = ? AND holder_id = ? AND expires_at > ? LIMIT 1",
+        )
+        .get(lockKey, holderId, nowIso);
+      return row !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
   public withImmediateTransaction<T>(fn: () => T): T {
     this.assertWritable("withImmediateTransaction");
     this.db.exec("BEGIN IMMEDIATE;");
@@ -1860,8 +1916,38 @@ export class SqlitePrivateHistoryRepository {
     let existingProductsObserved = 0;
     let earlyScanRunResult: PersistApprovedBatchResult | undefined;
 
+    if (options.requiredWorkerLock) {
+      const held = this.isWorkerLockHeldBy(
+        options.requiredWorkerLock.lockKey,
+        options.requiredWorkerLock.holderId,
+      );
+      if (!held) {
+        return {
+          persisted: false,
+          reason: "TRANSACTION_FAILED",
+          scanRunId: context.scanRunId,
+          observationsInserted: 0,
+          observationsSkippedDuplicate: 0,
+          opportunitiesInserted: 0,
+          errorSummary: `Worker lock '${options.requiredWorkerLock.lockKey}' is not held by '${options.requiredWorkerLock.holderId}'. Persistence aborted before transaction.`,
+        };
+      }
+    }
+
     try {
       this.withImmediateTransaction(() => {
+        if (options.requiredWorkerLock) {
+          const held = this.isWorkerLockHeldBy(
+            options.requiredWorkerLock.lockKey,
+            options.requiredWorkerLock.holderId,
+          );
+          if (!held) {
+            throw new Error(
+              `Worker lock '${options.requiredWorkerLock.lockKey}' is not held by '${options.requiredWorkerLock.holderId}'. Persistence transaction aborted.`,
+            );
+          }
+        }
+
         const firstListing = context.listings[0];
         if (!firstListing) {
           throw new Error("Empty listings in eligible batch.");
@@ -2426,6 +2512,19 @@ export class SqlitePrivateHistoryRepository {
           throw new Error(
             `Execution consistency check failed for scan_run_id '${context.scanRunId}': expected (${String(observationsInserted)}, ${String(opportunitiesInserted)}) but persisted (${String(actualObsCount)}, ${String(actualOppCount)}).`,
           );
+        }
+
+        // F7-09: Re-verify worker lock ownership within the transaction immediately before commit
+        if (options.requiredWorkerLock) {
+          const held = this.isWorkerLockHeldBy(
+            options.requiredWorkerLock.lockKey,
+            options.requiredWorkerLock.holderId,
+          );
+          if (!held) {
+            throw new Error(
+              `Worker lock '${options.requiredWorkerLock.lockKey}' expired or lost ownership before commit. Persistence transaction aborted.`,
+            );
+          }
         }
 
         // 4. Mark scan_run as SUCCEEDED
