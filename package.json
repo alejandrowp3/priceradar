@@ -13,6 +13,7 @@
     "dev": "node scripts/check-port.mjs && pnpm --filter @priceradar/web dev",
     "build": "pnpm -r build",
     "start": "node scripts/check-port.mjs && pnpm --filter @priceradar/web start",
+    "cloud:start": "node --experimental-strip-types apps/worker/src/cloud-entrypoint.ts",
     "worker:scan": "pnpm --filter @priceradar/worker scan",
     "rappi:inspect": "pnpm --filter @priceradar/worker rappi:inspect",
     "history:cli": "pnpm --filter @priceradar/worker history:cli",
@@ -29,6 +30,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:runtime": "node --experimental-strip-types scripts/verify-dashboard-runtime.mjs",
+    "verify:container": "node scripts/verify-cloud-container.mjs",
     "test:e2e": "node scripts/check-port.mjs && playwright test"
   },
   "devDependencies": {

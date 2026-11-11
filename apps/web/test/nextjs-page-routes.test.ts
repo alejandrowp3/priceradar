@@ -13,6 +13,9 @@ import ProductsPage from "../src/app/products/page";
 import OpportunitiesPage from "../src/app/opportunities/page";
 import CoveragePage from "../src/app/coverage/page";
 import ProductDetailPage from "../src/app/products/[id]/page";
+import SystemStatusPage from "../src/app/system/page";
+import { GET as healthRoute } from "../src/app/api/health/route";
+import { GET as telemetryRoute } from "../src/app/api/telemetry/route";
 
 const VALID_CTX_HASH = "ctx-88be5762563932c5";
 
@@ -291,6 +294,110 @@ describe("Next.js Server Component Route Execution (P4 Runtime Fix)", () => {
         params: Promise.resolve({ id: "rappi::unknown-product-999::std" }),
       });
       expect(page).toBeDefined();
+    });
+
+    it("renders SystemStatusPage with infrastructure telemetry and scan runs", () => {
+      const page = SystemStatusPage();
+      expect(page).toBeDefined();
+    });
+
+    it("responds with minimal non-leaking HTTP 200 payload on public /api/health (F7-02)", async () => {
+      const response = await healthRoute();
+      expect(response.status).toBe(200);
+      const json = await response.json();
+      expect(json).toEqual({
+        status: "healthy",
+        ready: true,
+      });
+      // Guarantees zero sensitive metadata or paths leaked on public endpoint
+      expect(json.database).toBeUndefined();
+      expect(json.dbPath).toBeUndefined();
+      expect(json.scheduler).toBeUndefined();
+    });
+
+    it("responds with detailed operational telemetry on private /api/telemetry (F7-02)", async () => {
+      const response = await telemetryRoute();
+      expect(response.status).toBe(200);
+      const json = await response.json();
+      expect(json.service).toBe("priceradar-cloud");
+      expect(json.database.connected).toBe(true);
+      expect(json.recentExecutionsCount).toBeDefined();
+    });
+
+    it("F7-08: /api/health returns HTTP 200 on first-time initialization when storage is writable but DB is not yet created", async () => {
+      const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), "priceradar-first-time-"));
+      const freshDbPath = path.join(freshDir, "private-history.sqlite");
+      process.env.PRICERADAR_SQLITE_PATH = freshDbPath;
+
+      try {
+        const response = await healthRoute();
+        expect(response.status).toBe(200);
+        const json = await response.json();
+        expect(json).toEqual({
+          status: "healthy",
+          ready: true,
+        });
+      } finally {
+        fs.rmSync(freshDir, { recursive: true, force: true });
+      }
+    });
+
+    it("F7-08: /api/health returns HTTP 503 when persistent storage directory does not exist or is not writable", async () => {
+      const nonexistentDbPath = "/nonexistent/invalid/mount/path/private-history.sqlite";
+      process.env.PRICERADAR_SQLITE_PATH = nonexistentDbPath;
+
+      const response = await healthRoute();
+      expect(response.status).toBe(503);
+      const json = await response.json();
+      expect(json).toEqual({
+        status: "unhealthy",
+        ready: false,
+      });
+      // Guarantees zero sensitive paths or internal details leaked in public 503 response
+      expect(json.dbPath).toBeUndefined();
+      expect(json.reason).toBeUndefined();
+      expect(json.error).toBeUndefined();
+    });
+
+    it("F7-08: /api/health returns HTTP 503 in cloud mode when scheduler heartbeat is stale", async () => {
+      const prevEnv = process.env.PRICERADAR_ENV;
+      process.env.PRICERADAR_ENV = "cloud";
+
+      const statusFile = path.join(tempDir, "scheduler-status.json");
+      fs.writeFileSync(
+        statusFile,
+        JSON.stringify({
+          isRunning: true,
+          lastHeartbeatAt: new Date(Date.now() - 150_000).toISOString(),
+        }),
+        "utf-8",
+      );
+
+      try {
+        const response = await healthRoute();
+        expect(response.status).toBe(503);
+        const json = await response.json();
+        expect(json).toEqual({
+          status: "unhealthy",
+          ready: false,
+        });
+      } finally {
+        if (prevEnv !== undefined) {
+          process.env.PRICERADAR_ENV = prevEnv;
+        } else {
+          delete process.env.PRICERADAR_ENV;
+        }
+      }
+    });
+
+    it("F7-08: /api/telemetry exposes storage readiness and init state to authenticated operators", async () => {
+      const response = await telemetryRoute();
+      expect(response.status).toBe(200);
+      const json = await response.json();
+      expect(json.storageReadiness).toBeDefined();
+      expect(json.storageReadiness.ready).toBe(true);
+      expect(json.storageReadiness.storageDirExists).toBe(true);
+      expect(json.storageReadiness.storageDirWritable).toBe(true);
     });
   });
 });

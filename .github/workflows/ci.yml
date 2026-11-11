@@ -67,3 +67,182 @@ jobs:
 
       - name: Run production build
         run: pnpm build
+
+      - name: Verify cloud container static configuration (F7-04, F7-09)
+        run: pnpm verify:container
+
+  container-runtime:
+    name: Container Build & Runtime Verification (F7-04, F7-07, F7-08)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Build production container image
+        run: docker build -t priceradar-cloud:ci .
+
+      - name: Verify headless Chromium launch in container (F7-04)
+        run: |
+          docker run --rm priceradar-cloud:ci node --experimental-strip-types apps/worker/src/chromium-readiness.ts
+
+      - name: Verify cloud container runtime startup, storage mount, and fail-closed auth
+        run: |
+          mkdir -p /tmp/priceradar-ci-data
+          docker run -d \
+            --name priceradar-ci \
+            -p 4178:4178 \
+            -v /tmp/priceradar-ci-data:/data \
+            -e PRICERADAR_ENV=cloud \
+            -e CI=true \
+            -e PRICERADAR_PERSISTENCE_TIER=SIMULATED_CI_VOLUME \
+            -e PRICERADAR_ALLOWED_HOSTS=127.0.0.1,localhost \
+            -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
+            -e PRICERADAR_SQLITE_PATH=/data/private-history.sqlite \
+            -e PRICERADAR_SCAN_ON_STARTUP=true \
+            priceradar-cloud:ci
+
+          echo "Waiting for container startup and health probe..."
+          for i in $(seq 1 30); do
+            if curl -s -f http://127.0.0.1:4178/api/health | grep -q '"status":"healthy"'; then
+              echo "Container health probe passed after ${i}s."
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Verifying public health probe returns 200 without auth..."
+          HEALTH_JSON=$(curl -s http://127.0.0.1:4178/api/health)
+          echo "$HEALTH_JSON" | grep -q '"status":"healthy"'
+          echo "$HEALTH_JSON" | grep -q '"ready":true'
+
+          echo "Verifying unauthenticated request to root fails closed with 401..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4178/)
+          if [ "$HTTP_CODE" != "401" ]; then
+            echo "ERROR: Expected HTTP 401 on unauthenticated root request, received $HTTP_CODE"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying unauthorized Host header is rejected with 403..."
+          FORGED_HOST_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: attacker.com" http://127.0.0.1:4178/)
+          if [ "$FORGED_HOST_CODE" != "403" ]; then
+            echo "ERROR: Expected HTTP 403 on forged Host header, received $FORGED_HOST_CODE"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying authenticated request to root succeeds with 200..."
+          AUTH_HEADER="Authorization: Basic $(echo -n ":CiTestSecret123" | base64)"
+          AUTH_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "$AUTH_HEADER" http://127.0.0.1:4178/)
+          if [ "$AUTH_HTTP_CODE" != "200" ]; then
+            echo "ERROR: Expected HTTP 200 on authenticated root request, received $AUTH_HTTP_CODE"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying private telemetry endpoint (F7-02, F7-10, F7-11)..."
+          TELEMETRY_JSON=$(curl -s -H "$AUTH_HEADER" http://127.0.0.1:4178/api/telemetry)
+          echo "$TELEMETRY_JSON" | grep -q '"service":"priceradar-cloud"'
+          echo "$TELEMETRY_JSON" | grep -q '"persistenceTier":"SIMULATED_CI_VOLUME"'
+          echo "$TELEMETRY_JSON" | grep -q '"persistenceVerified":true'
+
+          echo "Recording deterministic identities, observation counts, and COP prices in Container 1 (F7-11C)..."
+          CONTAINER_1_VOL_ID=$(echo "$TELEMETRY_JSON" | grep -o '"volumeId":"[^"]*"' | head -1 | cut -d'"' -f4)
+          OBS_COUNT_1=$(echo "$TELEMETRY_JSON" | grep -o '"totalActiveObservations":[0-9]*' | head -1 | cut -d':' -f2)
+          PROD_COUNT_1=$(echo "$TELEMETRY_JSON" | grep -o '"totalDistinctProducts":[0-9]*' | head -1 | cut -d':' -f2)
+          echo "Container 1 Volume ID: $CONTAINER_1_VOL_ID"
+          echo "Container 1 Observations: $OBS_COUNT_1"
+          echo "Container 1 Products: $PROD_COUNT_1"
+
+          if [ -z "$OBS_COUNT_1" ] || [ "$OBS_COUNT_1" -le 0 ]; then
+            echo "ERROR: Container 1 did not persist observations (count: $OBS_COUNT_1)"
+            docker logs priceradar-ci
+            exit 1
+          fi
+
+          echo "Verifying specific synthetic product identities and COP prices in Container 1..."
+          echo "$TELEMETRY_JSON" | grep -q 'prod-cafe-huila'
+          echo "$TELEMETRY_JSON" | grep -q '31500'
+          echo "$TELEMETRY_JSON" | grep -q 'prod-aceite-oliva-med'
+          echo "$TELEMETRY_JSON" | grep -q '48000'
+
+          echo "Verifying persistent storage files created in mounted volume..."
+          ls -la /tmp/priceradar-ci-data/
+
+          echo "Stopping Container 1 to test container replacement and database continuity (F7-11C)..."
+          docker stop priceradar-ci
+          docker rm priceradar-ci
+
+          echo "Starting Container 2 (replacement container mounting same volume, scan disabled to verify pure persistence)..."
+          docker run -d \
+            --name priceradar-ci-restarted \
+            -p 4178:4178 \
+            -v /tmp/priceradar-ci-data:/data \
+            -e PRICERADAR_ENV=cloud \
+            -e CI=true \
+            -e PRICERADAR_PERSISTENCE_TIER=SIMULATED_CI_VOLUME \
+            -e PRICERADAR_ALLOWED_HOSTS=127.0.0.1,localhost \
+            -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
+            -e PRICERADAR_SQLITE_PATH=/data/private-history.sqlite \
+            -e PRICERADAR_SCAN_ON_STARTUP=false \
+            priceradar-cloud:ci
+
+          echo "Waiting for Container 2 startup and health probe..."
+          for i in $(seq 1 30); do
+            if curl -s -f http://127.0.0.1:4178/api/health | grep -q '"status":"healthy"'; then
+              echo "Container 2 health probe passed after ${i}s."
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Verifying Container 2 reconnected to existing volume with stable identity (F7-11C)..."
+          TELEMETRY_2_JSON=$(curl -s -H "$AUTH_HEADER" http://127.0.0.1:4178/api/telemetry)
+          CONTAINER_2_VOL_ID=$(echo "$TELEMETRY_2_JSON" | grep -o '"volumeId":"[^"]*"' | head -1 | cut -d'"' -f4)
+          OBS_COUNT_2=$(echo "$TELEMETRY_2_JSON" | grep -o '"totalActiveObservations":[0-9]*' | head -1 | cut -d':' -f2)
+          PROD_COUNT_2=$(echo "$TELEMETRY_2_JSON" | grep -o '"totalDistinctProducts":[0-9]*' | head -1 | cut -d':' -f2)
+
+          echo "Container 2 Volume ID: $CONTAINER_2_VOL_ID"
+          echo "Container 2 Observations: $OBS_COUNT_2"
+          echo "Container 2 Products: $PROD_COUNT_2"
+
+          if [ "$CONTAINER_1_VOL_ID" != "$CONTAINER_2_VOL_ID" ]; then
+            echo "ERROR: Volume ID changed across container replacement: '$CONTAINER_1_VOL_ID' vs '$CONTAINER_2_VOL_ID'"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
+
+          if [ "$OBS_COUNT_1" != "$OBS_COUNT_2" ]; then
+            echo "ERROR: Observation counts do not match across replacement: '$OBS_COUNT_1' vs '$OBS_COUNT_2'"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
+
+          if [ "$PROD_COUNT_1" != "$PROD_COUNT_2" ]; then
+            echo "ERROR: Product counts do not match across replacement: '$PROD_COUNT_1' vs '$PROD_COUNT_2'"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
+
+          echo "Verifying exact persisted identities and COP prices survived in Container 2..."
+          echo "$TELEMETRY_2_JSON" | grep -q 'prod-cafe-huila'
+          echo "$TELEMETRY_2_JSON" | grep -q '31500'
+          echo "$TELEMETRY_2_JSON" | grep -q 'prod-aceite-oliva-med'
+          echo "$TELEMETRY_2_JSON" | grep -q '48000'
+
+          echo "Confirming replacement did NOT silently recreate an empty database..."
+          if [ "$OBS_COUNT_2" -le 0 ]; then
+            echo "ERROR: Database in Container 2 is empty after replacement!"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
+
+          echo "Confirming Container 2 readiness remains healthy..."
+          C2_HEALTH=$(curl -s http://127.0.0.1:4178/api/health)
+          echo "$C2_HEALTH" | grep -q '"status":"healthy"'
+          echo "$C2_HEALTH" | grep -q '"ready":true'
+
+          echo "Container replacement and persistent database continuity verification PASSED!"
+          docker stop priceradar-ci-restarted
+          docker rm priceradar-ci-restarted

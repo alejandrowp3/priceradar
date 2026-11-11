@@ -33,3 +33,18 @@ export const DEFAULT_WORKER_RUNTIME_CONFIG: WorkerRuntimeConfig = {
   baseBackoffMs: 500,
   targetScanIntervalMinutes: 15,
 };
+
+export interface CloudDeploymentConfig {
+  readonly sqlitePath: string;
+  readonly scheduleIntervalMinutes: number;
+  readonly scanOnStartup: boolean;
+  readonly allowedHosts: readonly string[];
+  readonly hasWebPassword: boolean;
+}
+
+export const DEFAULT_CLOUD_CONFIG = {
+  defaultSqlitePath: "/data/private-history.sqlite",
+  defaultScheduleIntervalMinutes: 60,
+  defaultScanOnStartup: true,
+  defaultPort: 4178,
+} as const;

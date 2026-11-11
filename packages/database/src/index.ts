@@ -180,3 +180,4 @@ export class InMemoryPriceRadarRepository implements PriceRadarStorageRepository
 }
 
 export * from "./sqlite-repository.ts";
+export * from "./storage-persistence.ts";

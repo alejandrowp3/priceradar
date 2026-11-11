@@ -51,7 +51,31 @@ export function OpportunityCard({ opportunity }: OpportunityCardProps) {
             flexWrap: "wrap",
           }}
         >
-          <PriceBadge opportunityType={opportunity.opportunityType} size="sm" />
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.375rem",
+              flexWrap: "wrap",
+            }}
+          >
+            <PriceBadge opportunityType={opportunity.opportunityType} size="sm" />
+            {opportunity.isSyntheticDemo && (
+              <span
+                style={{
+                  fontSize: "0.6875rem",
+                  fontWeight: 600,
+                  padding: "0.125rem 0.375rem",
+                  borderRadius: "var(--radius-sm)",
+                  backgroundColor: "rgba(148, 163, 184, 0.15)",
+                  color: "var(--text-muted)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                [DEMO SINTÉTICO]
+              </span>
+            )}
+          </div>
           <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
             {formattedDate}
           </span>

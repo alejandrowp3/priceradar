@@ -1,4 +1,5 @@
 import { spawn, execSync } from "node:child_process";
+import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -157,6 +158,8 @@ function seedFixtureDatabase(dbPath) {
   repo.close();
 }
 
+const TEST_WEB_PASSWORD = "runtime-test-secret-123";
+
 async function startServer(mode, port, dbPath) {
   console.log(`[Next.js Runtime Test] Starting '${mode}' on port ${port}...`);
   const child = spawn(nextBin, [mode, "-p", String(port), "-H", "127.0.0.1"], {
@@ -165,42 +168,44 @@ async function startServer(mode, port, dbPath) {
       ...process.env,
       PORT: String(port),
       PRICERADAR_SQLITE_PATH: dbPath,
+      PRICERADAR_WEB_PASSWORD: TEST_WEB_PASSWORD,
+      PRICERADAR_ALLOWED_HOSTS: "127.0.0.1,localhost",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  let stderrLogs = "";
+  let allLogs = "";
   child.stderr.on("data", (chunk) => {
-    stderrLogs += chunk.toString();
+    allLogs += chunk.toString();
   });
   child.stdout.on("data", (chunk) => {
-    const msg = chunk.toString();
-    if (msg.includes("Error")) {
-      stderrLogs += msg;
-    }
+    allLogs += chunk.toString();
   });
 
   const baseUrl = `http://127.0.0.1:${port}`;
 
-  // Poll until ready (up to 20s)
+  // Poll until ready (up to 20s) via unauthenticated health probe
   const startTime = Date.now();
   let ready = false;
+  let lastFetchError = "";
 
   while (Date.now() - startTime < 20000) {
     try {
-      const res = await fetch(`${baseUrl}/`, {
+      const res = await fetch(`${baseUrl}/api/health`, {
         headers: { host: `127.0.0.1:${port}` },
       });
-      // If we get an HTTP response (even error), server is responding
       if (res.status === 200) {
         ready = true;
         break;
       }
+      lastFetchError = `HTTP ${res.status}: ${await res.text()}`;
       if (res.status === 500) {
-        const text = await res.text();
-        throw new Error(`Server returned HTTP 500 on startup:\n${text}\n${stderrLogs}`);
+        throw new Error(
+          `Server returned HTTP 500 on startup:\n${lastFetchError}\n${allLogs}`,
+        );
       }
     } catch (e) {
+      lastFetchError = e.message || String(e);
       if (e.message && e.message.includes("HTTP 500")) {
         child.kill("SIGTERM");
         throw e;
@@ -213,7 +218,7 @@ async function startServer(mode, port, dbPath) {
   if (!ready) {
     child.kill("SIGTERM");
     throw new Error(
-      `Next.js server in '${mode}' mode failed to respond within 20s. Logs:\n${stderrLogs}`,
+      `Next.js server in '${mode}' mode failed to respond within 20s. Last fetch error: ${lastFetchError}. Logs:\n${allLogs}`,
     );
   }
 
@@ -229,11 +234,28 @@ async function startServer(mode, port, dbPath) {
 }
 
 async function verifyRoutes(baseUrl, port, expectedVariantKey) {
+  const authHeader = `Basic ${Buffer.from(`:${TEST_WEB_PASSWORD}`).toString("base64")}`;
+
+  // 1. Verify unauthenticated request to protected route fails closed with 401
+  const unauthRes = await fetch(`${baseUrl}/`, {
+    headers: { host: `127.0.0.1:${port}` },
+  });
+  if (unauthRes.status !== 401) {
+    throw new Error(
+      `Expected HTTP 401 on unauthenticated route request, got HTTP ${unauthRes.status}`,
+    );
+  }
+  console.log(
+    "  ✓ Fail-closed authentication verified: unauthenticated request returned HTTP 401",
+  );
+
   const routes = [
     { path: "/", name: "Overview" },
     { path: "/products", name: "Products" },
     { path: "/opportunities", name: "Opportunities" },
     { path: "/coverage", name: "Coverage" },
+    { path: "/system", name: "System" },
+    { path: "/api/health", name: "HealthApi" },
     {
       path: `/products/${encodeURIComponent(expectedVariantKey)}`,
       name: "ProductDetail",
@@ -243,7 +265,10 @@ async function verifyRoutes(baseUrl, port, expectedVariantKey) {
   for (const route of routes) {
     const url = `${baseUrl}${route.path}`;
     const res = await fetch(url, {
-      headers: { host: `127.0.0.1:${port}` },
+      headers: {
+        host: `127.0.0.1:${port}`,
+        Authorization: authHeader,
+      },
     });
 
     if (res.status !== 200) {
@@ -313,8 +338,9 @@ async function main() {
     // 4. Test EMPTY DATABASE state
     console.log(`\n--- Test Phase 3: Empty Database State ('next start') ---`);
     const emptyServer = await startServer("start", 4187, emptyDbPath);
+    const emptyAuthHeader = `Basic ${Buffer.from(`:${TEST_WEB_PASSWORD}`).toString("base64")}`;
     const emptyRes = await fetch(`${emptyServer.baseUrl}/`, {
-      headers: { host: "127.0.0.1:4187" },
+      headers: { host: "127.0.0.1:4187", Authorization: emptyAuthHeader },
     });
     if (emptyRes.status !== 200) {
       throw new Error(`Empty database route returned HTTP ${emptyRes.status}`);

@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: priceradar
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard # 2GB RAM required for Playwright Chromium
+    region: oregon
+    healthCheckPath: /api/health
+    disk:
+      name: priceradar-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: PRICERADAR_SQLITE_PATH
+        value: /data/private-history.sqlite
+      - key: PRICERADAR_SCHEDULE_INTERVAL_MINUTES
+        value: "60"
+      - key: PRICERADAR_SCAN_ON_STARTUP
+        value: "true"
+      - key: NODE_ENV
+        value: production
+      - key: PRICERADAR_ENV
+        value: cloud
+      - key: PRICERADAR_ALLOWED_HOSTS
+        sync: false
+      - key: PRICERADAR_WEB_PASSWORD
+        sync: false
+      - key: PRICERADAR_AUTH_SECRET
+        generateValue: true
+      - key: PRICERADAR_HMAC_SECRET
+        generateValue: true
