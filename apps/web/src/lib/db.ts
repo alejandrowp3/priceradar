@@ -13,7 +13,20 @@ import type {
   ListCatalogProductsOptions,
   PaginatedResult,
   ProductDetailView,
+  PersistedScanRunRow,
 } from "@priceradar/database";
+
+export interface CloudSchedulerStatusInfo {
+  readonly isRunning: boolean;
+  readonly totalScansExecuted: number;
+  readonly lastScanStartedAt?: string;
+  readonly lastScanCompletedAt?: string;
+  readonly lastScanStatus?: string;
+  readonly nextScheduledScanAt?: string;
+  readonly intervalMinutes: number;
+  readonly activeProvider: string;
+  readonly lastErrorSummary?: string;
+}
 
 let cachedRepo: SqlitePrivateHistoryRepository | null = null;
 let cachedPath: string | null = null;
@@ -108,4 +121,29 @@ export function fetchCoverageReport(): {
     return { report: null, dbExists: false };
   }
   return { report: repo.getCatalogCoverageReport(), dbExists: true };
+}
+
+export function fetchRecentScanRuns(limit = 20): {
+  readonly runs: readonly PersistedScanRunRow[];
+  readonly dbExists: boolean;
+} {
+  const { repo, dbExists } = getReadOnlyDatabase();
+  if (!repo || !dbExists) {
+    return { runs: [], dbExists: false };
+  }
+  return { runs: repo.listRecentScanRuns(limit), dbExists: true };
+}
+
+export function fetchSchedulerStatus(): CloudSchedulerStatusInfo | null {
+  const dbPath = path.resolve(getDatabasePath());
+  const statusFile = path.join(path.dirname(dbPath), "scheduler-status.json");
+  if (fs.existsSync(statusFile)) {
+    try {
+      const content = fs.readFileSync(statusFile, "utf-8");
+      return JSON.parse(content) as CloudSchedulerStatusInfo;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }

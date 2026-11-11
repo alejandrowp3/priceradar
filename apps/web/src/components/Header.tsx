@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { href: "/opportunities", label: "Oportunidades" },
   { href: "/products", label: "Productos" },
   { href: "/coverage", label: "Cobertura" },
+  { href: "/system", label: "Sistema" },
 ];
 
 export function Header() {

@@ -13,6 +13,8 @@ import ProductsPage from "../src/app/products/page";
 import OpportunitiesPage from "../src/app/opportunities/page";
 import CoveragePage from "../src/app/coverage/page";
 import ProductDetailPage from "../src/app/products/[id]/page";
+import SystemStatusPage from "../src/app/system/page";
+import { GET as healthRoute } from "../src/app/api/health/route";
 
 const VALID_CTX_HASH = "ctx-88be5762563932c5";
 
@@ -291,6 +293,20 @@ describe("Next.js Server Component Route Execution (P4 Runtime Fix)", () => {
         params: Promise.resolve({ id: "rappi::unknown-product-999::std" }),
       });
       expect(page).toBeDefined();
+    });
+
+    it("renders SystemStatusPage with infrastructure telemetry and scan runs", () => {
+      const page = SystemStatusPage();
+      expect(page).toBeDefined();
+    });
+
+    it("responds with HTTP 200 and JSON payload on /api/health", async () => {
+      const response = await healthRoute();
+      expect(response.status).toBe(200);
+      const json = await response.json();
+      expect(json.status).toBe("healthy");
+      expect(json.database.connected).toBe(true);
+      expect(json.scheduler).toBeDefined();
     });
   });
 });

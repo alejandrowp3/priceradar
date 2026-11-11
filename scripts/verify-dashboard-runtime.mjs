@@ -234,6 +234,8 @@ async function verifyRoutes(baseUrl, port, expectedVariantKey) {
     { path: "/products", name: "Products" },
     { path: "/opportunities", name: "Opportunities" },
     { path: "/coverage", name: "Coverage" },
+    { path: "/system", name: "System" },
+    { path: "/api/health", name: "HealthApi" },
     {
       path: `/products/${encodeURIComponent(expectedVariantKey)}`,
       name: "ProductDetail",

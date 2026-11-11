@@ -32,6 +32,11 @@ export const FORBIDDEN_PORTS = Object.freeze([
  * @returns {{ valid: boolean; reason?: string }}
  */
 export function validatePortPolicy(port) {
+  // In cloud container environments, port assignment is managed by the cloud host
+  if (process.env.PRICERADAR_ENV === "cloud" || process.env.RAILWAY_ENVIRONMENT) {
+    return { valid: true };
+  }
+
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     return {
       valid: false,
