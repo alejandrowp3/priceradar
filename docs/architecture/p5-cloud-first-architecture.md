@@ -50,10 +50,13 @@ As clarified by the repository owner, **PriceRadar must be hosted in the cloud f
 - **Engine**: SQLite 3 with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`).
 - **Location**: `/data/private-history.sqlite` on a dedicated 5 GB persistent SSD volume mounted at `/data`.
 - **Repository Isolation**: `/data` is outside `/app` (the Git repository root), satisfying `assertDatabasePathOutsideRepository()`.
-- **Storage Readiness & Lifecycle (`F7-08`)**:
+- **Storage Readiness & Persistent Contract (`F7-08`, `F7-11`)**:
+  - The system explicitly distinguishes a writable filesystem from a verified persistent volume (`F7-11`). Dockerfile `VOLUME ["/data"]` alone is not proof of durable cloud storage.
+  - In cloud mode (`PRICERADAR_ENV=cloud` or platform indicators), verified persistent volumes are recognized via `RAILWAY_VOLUME_NAME`, `RAILWAY_VOLUME_MOUNT_PATH`, or `PRICERADAR_VOLUME_NAME`. Unverified ephemeral container filesystems fail closed with HTTP 503 to prevent data loss.
+  - In CI, simulated persistent volumes are explicitly tagged with `PRICERADAR_PERSISTENCE_TIER="SIMULATED_CI_VOLUME"`.
+  - Atomic volume markers (`.priceradar-volume-marker.json`) are written upon volume mount to establish stable volume identity across container restarts and replacements.
   - The readiness probe distinguishes first-time initialization (mounted and writable volume before the initial scan has executed) from an unmounted or inaccessible volume.
-  - If `/data` does not exist or is not writable, `/api/health` returns HTTP 503 without leaking filesystem paths.
-  - When the database file exists, read integrity is verified before reporting healthy.
+  - When the database file exists, read integrity and schema readiness are verified before reporting healthy.
 - **Concurrency Model & Distributed Lease Locks (`F7-06`, `F7-09`)**:
   - `railway.json` sets `numReplicas: 1` ensuring a single active container instance.
   - Next.js Server Components instantiate `SqlitePrivateHistoryRepository` in strict read-only mode (`{ readOnly: true }`).
@@ -77,9 +80,11 @@ As clarified by the repository owner, **PriceRadar must be hosted in the cloud f
    - In cloud mode, authentication fails closed: missing, empty, or whitespace-only password configuration results in HTTP 401 on all protected routes and prevents cloud startup.
    - When configured, requests must supply valid HTTP Basic Auth credentials (`Authorization: Basic <base64>`).
    - Unauthenticated requests receive HTTP 401 with `WWW-Authenticate: Basic realm="PriceRadar Private Dashboard"`, prompting the browser's native login modal.
-3. **Platform Health Check & Telemetry Separation (`F7-02`, `F7-08`)**:
-   - `/api/health` is exempt from Basic Auth and provides a minimal public readiness probe (`{"status":"healthy","ready":true}`). It exposes zero filesystem paths, database names, fulfillment hashes, or scheduler timestamps. In cloud mode, it returns HTTP 503 if storage is unmounted or if the scheduler heartbeat is stale.
-   - `/api/telemetry` provides detailed operational KPIs and requires full authentication.
+3. **Platform Health Check & Positive Scheduler Evidence (`F7-02`, `F7-08`, `F7-10`, `F7-11`)**:
+   - `/api/health` is exempt from Basic Auth and provides a minimal public readiness probe (`{"status":"healthy","ready":true}`). It exposes zero filesystem paths, database names, fulfillment hashes, or scheduler timestamps.
+   - **Positive Evidence Requirement (`F7-10`)**: In cloud mode, `/api/health` strictly requires positive evidence of an active scheduler with a fresh heartbeat. It fails closed (HTTP 503) if the scheduler is stopped (`isRunning: false`), if the status file is missing or unparseable after the startup grace window, or if the heartbeat timestamp is stale (`> 90s`) or future-dated (`> 5s`).
+   - **Startup Window & Deadlock Prevention (`F7-10`)**: Genuine initial startup (`isFirstTimeInit: true` on verified storage with an active scheduler running its initial collection cycle with `totalScansExecuted: 0`) reports healthy (HTTP 200) to prevent deployment readiness deadlocks while remaining fail-closed against unverified or dead processes.
+   - `/api/telemetry` provides detailed operational KPIs (including persistence tier, volume marker, scheduler heartbeat age, and scan run history) and requires full authentication.
 
 ---
 

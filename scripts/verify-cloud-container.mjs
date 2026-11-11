@@ -138,7 +138,45 @@ if (fs.existsSync(schedulerPath)) {
   );
 }
 
-// 5. Railway configuration check (F7-09)
+// 5. Storage persistence contract & readiness checks (F7-10, F7-11)
+const storagePersistencePath = path.join(
+  workspaceRoot,
+  "packages",
+  "database",
+  "src",
+  "storage-persistence.ts",
+);
+assertCondition(
+  "Storage persistence contract module exists",
+  fs.existsSync(storagePersistencePath),
+);
+
+if (fs.existsSync(storagePersistencePath)) {
+  const content = fs.readFileSync(storagePersistencePath, "utf-8");
+  assertCondition(
+    "Storage persistence distinguishes persistent tiers from ephemeral filesystems",
+    content.includes("verifyStoragePersistenceContract") &&
+      content.includes("UNVERIFIED_EPHEMERAL_FILESYSTEM") &&
+      content.includes("RAILWAY_PERSISTENT_VOLUME"),
+  );
+  assertCondition(
+    "Storage persistence writes atomic volume marker for restart durability",
+    content.includes("VOLUME_MARKER_FILENAME") && content.includes(".tmp"),
+  );
+}
+
+const dbLibPath = path.join(workspaceRoot, "apps", "web", "src", "lib", "db.ts");
+if (fs.existsSync(dbLibPath)) {
+  const content = fs.readFileSync(dbLibPath, "utf-8");
+  assertCondition(
+    "System readiness requires positive evidence of active scheduler in cloud mode (F7-10)",
+    content.includes("checkSystemReadiness") &&
+      content.includes("schedulerStatus.isRunning") &&
+      content.includes("isFutureDated"),
+  );
+}
+
+// 6. Railway configuration check (F7-09)
 const railwayConfigPath = path.join(workspaceRoot, "railway.json");
 assertCondition(
   "railway.json exists at workspace root",

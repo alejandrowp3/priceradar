@@ -94,6 +94,7 @@ jobs:
             -p 4178:4178 \
             -v /tmp/priceradar-ci-data:/data \
             -e PRICERADAR_ENV=cloud \
+            -e PRICERADAR_PERSISTENCE_TIER=SIMULATED_CI_VOLUME \
             -e PRICERADAR_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
             -e PRICERADAR_SQLITE_PATH=/data/private-history.sqlite \
@@ -139,13 +140,59 @@ jobs:
             exit 1
           fi
 
-          echo "Verifying private telemetry endpoint..."
+          echo "Verifying private telemetry endpoint (F7-02, F7-10, F7-11)..."
           TELEMETRY_JSON=$(curl -s -H "$AUTH_HEADER" http://127.0.0.1:4178/api/telemetry)
           echo "$TELEMETRY_JSON" | grep -q '"service":"priceradar-cloud"'
+          echo "$TELEMETRY_JSON" | grep -q '"persistenceTier":"SIMULATED_CI_VOLUME"'
+          echo "$TELEMETRY_JSON" | grep -q '"persistenceVerified":true'
 
-          echo "Verifying persistent storage file was created in mounted volume..."
+          echo "Extracting volume marker ID from Container 1..."
+          CONTAINER_1_VOL_ID=$(echo "$TELEMETRY_JSON" | grep -o '"volumeId":"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "Container 1 Volume ID: $CONTAINER_1_VOL_ID"
+
+          echo "Verifying persistent storage files created in mounted volume..."
           ls -la /tmp/priceradar-ci-data/
 
-          echo "Container runtime verification passed!"
+          echo "Stopping Container 1 to test restart & replacement survivability (F7-11)..."
           docker stop priceradar-ci
           docker rm priceradar-ci
+
+          echo "Starting Container 2 (replacement container mounting same volume)..."
+          docker run -d \
+            --name priceradar-ci-restarted \
+            -p 4178:4178 \
+            -v /tmp/priceradar-ci-data:/data \
+            -e PRICERADAR_ENV=cloud \
+            -e PRICERADAR_PERSISTENCE_TIER=SIMULATED_CI_VOLUME \
+            -e PRICERADAR_ALLOWED_HOSTS=127.0.0.1,localhost \
+            -e PRICERADAR_WEB_PASSWORD=CiTestSecret123 \
+            -e PRICERADAR_SQLITE_PATH=/data/private-history.sqlite \
+            -e PRICERADAR_SCAN_ON_STARTUP=false \
+            priceradar-cloud:ci
+
+          echo "Waiting for Container 2 startup and health probe..."
+          for i in $(seq 1 30); do
+            if curl -s -f http://127.0.0.1:4178/api/health | grep -q '"status":"healthy"'; then
+              echo "Container 2 health probe passed after ${i}s."
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Verifying Container 2 reconnected to existing volume with stable identity..."
+          TELEMETRY_2_JSON=$(curl -s -H "$AUTH_HEADER" http://127.0.0.1:4178/api/telemetry)
+          CONTAINER_2_VOL_ID=$(echo "$TELEMETRY_2_JSON" | grep -o '"volumeId":"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "Container 2 Volume ID: $CONTAINER_2_VOL_ID"
+
+          if [ "$CONTAINER_1_VOL_ID" != "$CONTAINER_2_VOL_ID" ]; then
+            echo "ERROR: Volume ID changed across container replacement: '$CONTAINER_1_VOL_ID' vs '$CONTAINER_2_VOL_ID'"
+            docker logs priceradar-ci-restarted
+            exit 1
+          fi
+
+          echo "Verifying data survived container replacement..."
+          echo "$TELEMETRY_2_JSON" | grep -q '"connected":true'
+
+          echo "Container replacement and persistent storage verification PASSED!"
+          docker stop priceradar-ci-restarted
+          docker rm priceradar-ci-restarted

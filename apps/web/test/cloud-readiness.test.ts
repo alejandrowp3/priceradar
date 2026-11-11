@@ -1,0 +1,427 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { checkSystemReadiness, checkStorageReadiness } from "../src/lib/db";
+import { GET as healthRoute } from "../src/app/api/health/route";
+import { GET as telemetryRoute } from "../src/app/api/telemetry/route";
+import { SqlitePrivateHistoryRepository } from "@priceradar/database";
+import type { DiscoveredListing } from "@priceradar/domain";
+import { createCopAmount } from "@priceradar/domain";
+
+const VALID_CTX_HASH = "ctx-88be5762563932c5";
+
+describe("Cloud Readiness & Health Probes (F7-10 & F7-11)", () => {
+  let tempDir: string;
+  let dbPath: string;
+  let statusFilePath: string;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "priceradar-cloud-readiness-"));
+    dbPath = path.join(tempDir, "private-history.sqlite");
+    statusFilePath = path.join(tempDir, "scheduler-status.json");
+    process.env.PRICERADAR_SQLITE_PATH = dbPath;
+  });
+
+  afterEach(() => {
+    process.env = { ...originalEnv };
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  describe("F7-10: Positive Scheduler Evidence Verification in Cloud Mode", () => {
+    const cloudEnv: NodeJS.ProcessEnv = {
+      PRICERADAR_ENV: "cloud",
+      RAILWAY_ENVIRONMENT: "production",
+      RAILWAY_VOLUME_NAME: "priceradar-data",
+    };
+
+    it("Case 1: Actively running scheduler with fresh heartbeat reports healthy (ready: true, HTTP 200)", async () => {
+      // Create fresh valid scheduler status file
+      const now = Date.now();
+      fs.writeFileSync(
+        statusFilePath,
+        JSON.stringify({
+          isRunning: true,
+          totalScansExecuted: 3,
+          lastHeartbeatAt: new Date(now - 10_000).toISOString(),
+          intervalMinutes: 60,
+          activeProvider: "fixture-catalog",
+        }),
+        "utf-8",
+      );
+
+      const readiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        nowMs: now,
+      });
+
+      expect(readiness.ready).toBe(true);
+      expect(readiness.schedulerReady).toBe(true);
+      expect(readiness.storage.ready).toBe(true);
+      expect(readiness.reason).toBeUndefined();
+
+      // Test HTTP /api/health endpoint
+      Object.assign(process.env, cloudEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json).toEqual({
+        status: "healthy",
+        ready: true,
+      });
+    });
+
+    it("Case 2: Missing status file / no scheduler reports unhealthy after initialization policy (HTTP 503)", async () => {
+      // Ensure no status file exists
+      if (fs.existsSync(statusFilePath)) {
+        fs.unlinkSync(statusFilePath);
+      }
+
+      // Beyond startup grace period
+      const readiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        uptimeMs: 30_000,
+        startupGracePeriodMs: 10_000,
+      });
+
+      expect(readiness.ready).toBe(false);
+      expect(readiness.schedulerReady).toBe(false);
+      expect(readiness.reason).toContain(
+        "Missing scheduler status: no active scheduler process found",
+      );
+
+      // Verify HTTP /api/health returns 503
+      Object.assign(process.env, cloudEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(503);
+      const json = await res.json();
+      expect(json.status).toBe("unhealthy");
+      expect(json.ready).toBe(false);
+    });
+
+    it("Case 3: Explicitly stopped scheduler (isRunning: false) reports unhealthy (HTTP 503)", async () => {
+      const now = Date.now();
+      fs.writeFileSync(
+        statusFilePath,
+        JSON.stringify({
+          isRunning: false,
+          totalScansExecuted: 5,
+          lastHeartbeatAt: new Date(now - 5_000).toISOString(),
+          intervalMinutes: 60,
+          activeProvider: "fixture-catalog",
+        }),
+        "utf-8",
+      );
+
+      const readiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        nowMs: now,
+      });
+
+      expect(readiness.ready).toBe(false);
+      expect(readiness.schedulerReady).toBe(false);
+      expect(readiness.reason).toContain("Scheduler is explicitly stopped or inactive");
+
+      Object.assign(process.env, cloudEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(503);
+    });
+
+    it("Case 4: Stale heartbeat (heartbeatAgeMs > 90s) reports unhealthy (HTTP 503)", async () => {
+      const now = Date.now();
+      const staleHeartbeatTime = new Date(now - 120_000).toISOString(); // 2 minutes ago
+      fs.writeFileSync(
+        statusFilePath,
+        JSON.stringify({
+          isRunning: true,
+          totalScansExecuted: 2,
+          lastHeartbeatAt: staleHeartbeatTime,
+          intervalMinutes: 60,
+          activeProvider: "fixture-catalog",
+        }),
+        "utf-8",
+      );
+
+      const readiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        nowMs: now,
+        freshnessThresholdMs: 90_000,
+      });
+
+      expect(readiness.ready).toBe(false);
+      expect(readiness.schedulerReady).toBe(false);
+      expect(readiness.reason).toContain("Scheduler heartbeat is stale or inactive");
+
+      Object.assign(process.env, cloudEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(503);
+    });
+
+    it("Case 5: Corrupted status file (invalid JSON) reports unhealthy (HTTP 503)", async () => {
+      fs.writeFileSync(statusFilePath, "NOT_VALID_JSON{{{ corrupted content", "utf-8");
+
+      const readiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        uptimeMs: 30_000,
+        startupGracePeriodMs: 10_000,
+      });
+
+      expect(readiness.ready).toBe(false);
+      expect(readiness.schedulerReady).toBe(false);
+      expect(readiness.reason).toContain(
+        "Missing scheduler status: no active scheduler process found",
+      );
+
+      Object.assign(process.env, cloudEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(503);
+    });
+
+    it("Case 6: Future heartbeat timestamp (> now + 5s) reports unhealthy (HTTP 503)", async () => {
+      const now = Date.now();
+      const futureHeartbeatTime = new Date(now + 60_000).toISOString(); // 1 minute in the future
+      fs.writeFileSync(
+        statusFilePath,
+        JSON.stringify({
+          isRunning: true,
+          totalScansExecuted: 1,
+          lastHeartbeatAt: futureHeartbeatTime,
+          intervalMinutes: 60,
+          activeProvider: "fixture-catalog",
+        }),
+        "utf-8",
+      );
+
+      const readiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        nowMs: now,
+        maxFutureToleranceMs: 5_000,
+      });
+
+      expect(readiness.ready).toBe(false);
+      expect(readiness.schedulerReady).toBe(false);
+      expect(readiness.reason).toContain("future-dated (clock skew or invalid state)");
+
+      Object.assign(process.env, cloudEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(503);
+    });
+
+    it("Case 7: Initial startup window behavior and prevention of readiness deadlock", async () => {
+      // 7a. Within startup grace window when scheduler is still booting (no status file yet)
+      const bootingReadiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        uptimeMs: 3_000, // Process just booted 3s ago
+        startupGracePeriodMs: 10_000,
+      });
+
+      expect(bootingReadiness.ready).toBe(false);
+      expect(bootingReadiness.reason).toContain(
+        "Scheduler is initializing during startup grace window",
+      );
+
+      // 7b. Scheduler has just started: 0 scans executed yet, but running with fresh heartbeat on first-time DB
+      const now = Date.now();
+      fs.writeFileSync(
+        statusFilePath,
+        JSON.stringify({
+          isRunning: true,
+          totalScansExecuted: 0,
+          lastHeartbeatAt: new Date(now - 1_000).toISOString(),
+          intervalMinutes: 60,
+          activeProvider: "fixture-catalog",
+        }),
+        "utf-8",
+      );
+
+      const initialStartupReadiness = checkSystemReadiness({
+        env: { ...process.env, ...cloudEnv },
+        nowMs: now,
+      });
+
+      expect(initialStartupReadiness.ready).toBe(true);
+      expect(initialStartupReadiness.isInitialStartup).toBe(true);
+      expect(initialStartupReadiness.storage.isFirstTimeInit).toBe(true);
+      expect(initialStartupReadiness.schedulerReady).toBe(true);
+
+      // Verify HTTP /api/health succeeds without deadlock on initial startup
+      Object.assign(process.env, cloudEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("F7-11: Verified Persistent Storage Contract & Data Survivability", () => {
+    it("fails closed in cloud mode when running on unverified ephemeral container filesystem", async () => {
+      const ephemeralEnv = {
+        ...process.env,
+        PRICERADAR_ENV: "cloud",
+        RAILWAY_ENVIRONMENT: "production",
+      };
+      delete ephemeralEnv.RAILWAY_VOLUME_NAME;
+      delete ephemeralEnv.PRICERADAR_VOLUME_NAME;
+      delete ephemeralEnv.PRICERADAR_PERSISTENCE_TIER;
+
+      const storageResult = checkStorageReadiness({ env: ephemeralEnv });
+      expect(storageResult.ready).toBe(false);
+      expect(storageResult.persistenceVerified).toBe(false);
+      expect(storageResult.persistenceTier).toBe("UNVERIFIED_EPHEMERAL_FILESYSTEM");
+      expect(storageResult.reason).toContain(
+        "Railway deployment detected without attached persistent volume",
+      );
+
+      const systemResult = checkSystemReadiness({ env: ephemeralEnv });
+      expect(systemResult.ready).toBe(false);
+      expect(systemResult.reason).toContain(
+        "Railway deployment detected without attached persistent volume",
+      );
+
+      // HTTP /api/health must reject unverified ephemeral storage with HTTP 503
+      Object.assign(process.env, ephemeralEnv);
+      const res = await healthRoute();
+      expect(res.status).toBe(503);
+    });
+
+    it("verifies Railway persistent volume and surfaces telemetry to authenticated operators", async () => {
+      const railwayEnv = {
+        ...process.env,
+        PRICERADAR_ENV: "cloud",
+        RAILWAY_ENVIRONMENT: "production",
+        RAILWAY_VOLUME_NAME: "priceradar-data",
+      };
+
+      const storageResult = checkStorageReadiness({ env: railwayEnv });
+      expect(storageResult.ready).toBe(true);
+      expect(storageResult.persistenceVerified).toBe(true);
+      expect(storageResult.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(storageResult.volumeMarker?.volumeName).toBe("priceradar-data");
+
+      // Verify telemetry endpoint exposes persistenceTier and volumeMarker
+      Object.assign(process.env, railwayEnv);
+      const res = await telemetryRoute();
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.storageReadiness.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(json.storageReadiness.persistenceVerified).toBe(true);
+      expect(json.storageReadiness.volumeMarker.volumeId).toBeDefined();
+    });
+
+    it("proves observation, scan run, and product data survivability across container replacement using same volume", () => {
+      const volumeEnv = {
+        ...process.env,
+        PRICERADAR_ENV: "cloud",
+        RAILWAY_ENVIRONMENT: "production",
+        RAILWAY_VOLUME_NAME: "priceradar-data",
+      };
+
+      // --- Container 1 Lifecycle ---
+      const initStorage = checkStorageReadiness({ env: volumeEnv });
+      expect(initStorage.persistenceVerified).toBe(true);
+      const volumeMarkerId = initStorage.volumeMarker?.volumeId;
+      expect(volumeMarkerId).toBeDefined();
+
+      const repo1 = new SqlitePrivateHistoryRepository(dbPath);
+      const listing: DiscoveredListing = {
+        providerId: "fixture-catalog",
+        store: {
+          providerId: "fixture-catalog",
+          externalStoreId: "store-001",
+          name: "Test Store",
+          categorySlug: "test",
+        },
+        variant: {
+          externalProductId: "prod-cloud-survive-001",
+          externalVariantId: "var-001",
+          name: "Durable Cloud Product",
+          brand: "Test Brand",
+          categorySlug: "test",
+          categoryName: "Test Category",
+          packagingLabel: "1 unidad",
+          unitQuantity: 1,
+          unitType: "unit",
+          productUrl: "https://example.com/test",
+        },
+        geographicContext: {
+          countryCode: "CO",
+          citySlug: "bogota",
+          cityName: "Bogota",
+          fulfillmentContextHash: VALID_CTX_HASH,
+        },
+        observedPriceCop: createCopAmount(25000),
+        availability: "IN_STOCK",
+        provenance: "DEMO_FIXTURE",
+        sourceObservedAt: "2026-11-11T12:00:00.000Z",
+      };
+
+      const scanResult1 = repo1.persistApprovedInspectionBatch(
+        {
+          scanRunId: "scan-container-1",
+          observedAtIso: "2026-11-11T12:00:00.000Z",
+          gateStatus: "VERIFIED_ACTIVE_SELECTION",
+          hasSecurityChallenge: false,
+          isLoginRequired: false,
+          isDeliveryContextVerified: true,
+          citySlug: "bogota",
+          cityName: "Bogota",
+          fulfillmentContextHash: VALID_CTX_HASH,
+          activeAddressSelection: "VERIFIED_ACTIVE_SELECTION",
+          cityAndNeighborhoodMetadata: "VERIFIED_FROM_ACTIVE_CONTEXT",
+          servingStoreBranch: "VERIFIED_ACTIVE_BRANCH",
+          productCatalogContext: "HYDRATED_FROM_ACTIVE_PAGE",
+          pricingVerificationVerdict: "CONFIRMED_DELIVERY_CONTEXT",
+          navigationStates: {
+            ADDRESS_SELECTED: true,
+            STORE_OPENED_FROM_ADDRESS_CONTEXT: true,
+            CATALOG_VISIBLE_IN_SESSION: true,
+            ADDRESS_SPECIFIC_PRICING_VERIFIED: true,
+          },
+          candidatesDiscoveredCount: 1,
+          skippedMalformedCount: 0,
+          duplicateSuppressedCount: 0,
+          listings: [listing],
+        },
+        { ownerConfirmed: true },
+      );
+
+      expect(scanResult1.persisted).toBe(true);
+      expect(scanResult1.observationsInserted).toBe(1);
+      expect(scanResult1.newProductsDiscovered).toBe(1);
+
+      const summary1 = repo1.getDashboardSummary();
+      expect(summary1.counts.totalDistinctProducts).toBe(1);
+      expect(summary1.counts.totalActiveObservations).toBe(1);
+
+      // Simulate Container 1 termination: close SQLite connection and discard instance
+      repo1.close();
+
+      // --- Container 2 Lifecycle (Replacement Container Attaching Same Persistent Volume) ---
+      const reconnectedStorage = checkStorageReadiness({ env: volumeEnv });
+      expect(reconnectedStorage.persistenceVerified).toBe(true);
+      // Volume marker was preserved with exact same volumeId
+      expect(reconnectedStorage.volumeMarker?.volumeId).toBe(volumeMarkerId);
+
+      // Container 2 opens SQLite on the volume
+      const repo2 = new SqlitePrivateHistoryRepository(dbPath, { readOnly: true });
+      const summary2 = repo2.getDashboardSummary();
+
+      // Verify 100% data fidelity: counts and identities survived unchanged
+      expect(summary2.counts.totalDistinctProducts).toBe(1);
+      expect(summary2.counts.totalActiveObservations).toBe(1);
+
+      const { items: products } = repo2.listCatalogProducts();
+      expect(products).toHaveLength(1);
+      expect(products[0]?.externalProductId).toBe("prod-cloud-survive-001");
+      expect(products[0]?.productName).toBe("Durable Cloud Product");
+
+      const productKey = products[0]?.productVariantKey ?? "";
+      expect(productKey).not.toBe("");
+      const productDetail = repo2.getProductDetail(productKey);
+      expect(productDetail).toBeDefined();
+      expect(productDetail?.observations).toHaveLength(1);
+      expect(productDetail?.observations[0]?.observedPriceCop).toBe(25000);
+
+      repo2.close();
+    });
+  });
+});

@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { verifyStoragePersistenceContract } from "@priceradar/database";
+import type { PersistenceTier, VolumeMarkerInfo } from "@priceradar/database";
 import { CloudScheduler } from "./cloud-scheduler.ts";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -14,11 +16,14 @@ export interface CloudStartupConfig {
   readonly intervalMinutes: number;
   readonly webPassword?: string;
   readonly isLoopback: boolean;
+  readonly persistenceTier: PersistenceTier;
+  readonly volumeMarker?: VolumeMarkerInfo | null;
 }
 
 /**
- * Validates cloud service configuration before process launch (`F7-01`).
- * Fails closed: non-loopback binding requires non-empty PRICERADAR_WEB_PASSWORD.
+ * Validates cloud service configuration before process launch (`F7-01`, `F7-11`).
+ * - Fails closed: non-loopback binding requires non-empty PRICERADAR_WEB_PASSWORD.
+ * - Fails closed: cloud environment requires verified persistent volume contract.
  */
 export function validateCloudStartupConfig(env: NodeJS.ProcessEnv): CloudStartupConfig {
   const port = env.PORT ?? "4178";
@@ -35,6 +40,22 @@ export function validateCloudStartupConfig(env: NodeJS.ProcessEnv): CloudStartup
     );
   }
 
+  // F7-11: Validate persistent storage contract before launching cloud workers
+  const storageDir = path.dirname(path.resolve(sqlitePath));
+  const persistenceResult = verifyStoragePersistenceContract(storageDir, env);
+
+  const isCloud =
+    env.PRICERADAR_ENV === "cloud" ||
+    Boolean(env.RAILWAY_ENVIRONMENT) ||
+    Boolean(env.RENDER) ||
+    Boolean(env.FLY_APP_NAME);
+
+  if (isCloud && !persistenceResult.persistenceVerified) {
+    throw new Error(
+      `Storage configuration violation: ${persistenceResult.reason ?? "Persistent storage verification failed."}`,
+    );
+  }
+
   return {
     port,
     host,
@@ -42,6 +63,8 @@ export function validateCloudStartupConfig(env: NodeJS.ProcessEnv): CloudStartup
     intervalMinutes,
     ...(webPassword ? { webPassword } : {}),
     isLoopback,
+    persistenceTier: persistenceResult.persistenceTier,
+    volumeMarker: persistenceResult.volumeMarker,
   };
 }
 
@@ -55,6 +78,10 @@ async function main(): Promise<void> {
   console.log(`Host           : ${config.host}`);
   console.log(`SQLite Path    : ${config.sqlitePath}`);
   console.log(`Scan Interval  : ${String(config.intervalMinutes)} minutes`);
+  console.log(`Persistence    : ${config.persistenceTier}`);
+  if (config.volumeMarker) {
+    console.log(`Volume ID      : ${config.volumeMarker.volumeId}`);
+  }
   console.log(
     `Web Auth       : ${config.webPassword ? "Enabled (Basic Auth)" : "Disabled (Loopback Only)"}`,
   );

@@ -4,6 +4,7 @@ import {
   fetchSchedulerStatus,
   fetchRecentScanRuns,
   checkStorageReadiness,
+  checkSystemReadiness,
 } from "../../../lib/db";
 
 export const dynamic = "force-dynamic";
@@ -17,6 +18,7 @@ export async function GET(): Promise<NextResponse> {
   const { dbExists } = getReadOnlyDatabase();
   const schedulerStatus = fetchSchedulerStatus();
   const storageReadiness = checkStorageReadiness();
+  const systemReadiness = checkSystemReadiness();
   const { runs } = fetchRecentScanRuns(5);
 
   const payload = {
@@ -28,6 +30,7 @@ export async function GET(): Promise<NextResponse> {
       storageReadiness,
     },
     storageReadiness,
+    systemReadiness,
     scheduler: schedulerStatus,
     recentExecutionsCount: runs.length,
     latestExecution: runs[0] ?? null,

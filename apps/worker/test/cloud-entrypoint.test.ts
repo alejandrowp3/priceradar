@@ -65,4 +65,44 @@ describe("Cloud Entrypoint Configuration Validation (F7-01 & F7-06)", () => {
     expect(config.host).toBe("0.0.0.0");
     expect(config.port).toBe("4178");
   });
+
+  describe("Persistent Storage Contract Validation (F7-11)", () => {
+    it("fails closed in cloud environment when persistent volume is not configured", () => {
+      expect(() => {
+        validateCloudStartupConfig({
+          HOST: "0.0.0.0",
+          PRICERADAR_WEB_PASSWORD: "secure-password-123",
+          PRICERADAR_ENV: "cloud",
+          RAILWAY_ENVIRONMENT: "production",
+          PRICERADAR_SQLITE_PATH: "/tmp/priceradar-ephemeral/private-history.sqlite",
+        });
+      }).toThrow(/Storage configuration violation/);
+    });
+
+    it("succeeds in cloud environment when attached Railway volume is configured", () => {
+      const config = validateCloudStartupConfig({
+        HOST: "0.0.0.0",
+        PRICERADAR_WEB_PASSWORD: "secure-password-123",
+        PRICERADAR_ENV: "cloud",
+        RAILWAY_ENVIRONMENT: "production",
+        RAILWAY_VOLUME_NAME: "priceradar-data",
+        PRICERADAR_SQLITE_PATH: "/tmp/private-history.sqlite",
+      });
+
+      expect(config.persistenceTier).toBe("RAILWAY_PERSISTENT_VOLUME");
+      expect(config.volumeMarker).toBeDefined();
+    });
+
+    it("succeeds in CI environment when SIMULATED_CI_VOLUME is configured", () => {
+      const config = validateCloudStartupConfig({
+        HOST: "0.0.0.0",
+        PRICERADAR_WEB_PASSWORD: "secure-password-123",
+        PRICERADAR_ENV: "cloud",
+        PRICERADAR_PERSISTENCE_TIER: "SIMULATED_CI_VOLUME",
+        PRICERADAR_SQLITE_PATH: "/tmp/private-history.sqlite",
+      });
+
+      expect(config.persistenceTier).toBe("SIMULATED_CI_VOLUME");
+    });
+  });
 });

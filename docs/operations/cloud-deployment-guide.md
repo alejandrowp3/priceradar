@@ -25,12 +25,13 @@ This guide describes how to deploy PriceRadar to **Railway** in under 5 minutes 
 1. In the project canvas, click on your PriceRadar service.
 2. Select the **Volumes** tab.
 3. Click **+ Add Volume**.
-4. Set the **Mount Path** to:
+4. Name the volume (e.g. `priceradar-data`) and set the **Mount Path** to:
    ```text
    /data
    ```
 5. Set the size to **5 GB** (SSD).
 6. Click **Save**.
+7. _(Note: PriceRadar automatically verifies the persistent volume contract via Railway-injected environment variables `RAILWAY_VOLUME_NAME` or `RAILWAY_VOLUME_MOUNT_PATH`. If a cloud deployment runs without an attached volume, startup and health probes will fail closed with HTTP 503 to prevent data loss on container replacement.)_
 
 ---
 
